@@ -19,8 +19,10 @@ from firewall_proxy.config import AppConfig, ProtectedRouteConfig, load_config
 from firewall_proxy.firewall import (
     FirewallDecision,
     FirewallEngine,
+    STRUCTURED_PII_PATTERNS,
     extract_first_matching_value,
     extract_user_text_from_sources,
+    mask_sensitive_value,
     normalize_user_message,
 )
 from firewall_proxy.log_store import AsyncSQLiteLogger, FirewallLogRecord
@@ -40,6 +42,54 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+ATTACHMENT_PAYLOAD_KEYS = {
+    "file_data",
+    "data",
+    "content_base64",
+    "base64",
+    "bytes",
+    "image_url",
+}
+
+
+def sanitize_payload_for_logs(payload: Any, decision: FirewallDecision | None = None) -> Any:
+    if isinstance(payload, dict):
+        sanitized: dict[str, Any] = {}
+        for key, value in payload.items():
+            key_lower = str(key).lower()
+            if key_lower in ATTACHMENT_PAYLOAD_KEYS and isinstance(value, str) and len(value) > 200:
+                sanitized[key] = f"[redacted attachment payload: {len(value)} chars]"
+                continue
+            sanitized[key] = sanitize_payload_for_logs(value, decision)
+        return sanitized
+
+    if isinstance(payload, list):
+        return [sanitize_payload_for_logs(item, decision) for item in payload]
+
+    if isinstance(payload, str):
+        if payload.startswith("data:") and len(payload) > 200:
+            return f"[redacted inline data payload: {len(payload)} chars]"
+        redacted = _redact_structured_pii(payload)
+        if decision and decision.prompt_injection.evaluated_text:
+            original = decision.prompt_injection.evaluated_text
+            if original in redacted and decision.latest_user_message != original:
+                redacted = redacted.replace(original, decision.latest_user_message)
+        return redacted
+
+    return payload
+
+
+def _redact_structured_pii(text: str) -> str:
+    redacted = text
+    for pattern in STRUCTURED_PII_PATTERNS.values():
+        matches = list(pattern.finditer(redacted))
+        for match in reversed(matches):
+            redacted = (
+                redacted[: match.start()]
+                + mask_sensitive_value(match.group(0))
+                + redacted[match.end() :]
+            )
+    return redacted
 
 
 def configure_logging(level: str) -> None:
@@ -66,12 +116,24 @@ def build_firewall_details(decision: FirewallDecision) -> dict[str, Any]:
         "trigger_layer": decision.trigger_layer,
         "message": decision.reason,
         "scores": {
-            "scope_score": decision.scope.scope_score,
-            "prompt_injection_score": decision.prompt_injection.malicious_probability,
+            "scope_main": decision.risk.scope_main,
+            "pg2_main": decision.risk.pg2_main,
+            "pii_main": decision.risk.pii_main,
+            "doc_pg2_max": decision.risk.doc_pg2_max,
+            "doc_scope_min": decision.risk.doc_scope_min,
+            "doc_flagged_ratio": decision.risk.doc_flagged_ratio,
+            "lg4_unsafe": decision.risk.lg4_unsafe,
+            "lg4_code_abuse": decision.risk.lg4_code_abuse,
+            "final_risk": decision.risk.final_risk,
         },
         "details": {
             "scope": decision.scope.to_dict(),
             "prompt_injection": decision.prompt_injection.to_dict(),
+            "pii": decision.pii.to_dict(),
+            "attachments": decision.attachments.to_dict(),
+            "llama_guard": decision.llama_guard.to_dict(),
+            "risk": decision.risk.to_dict(),
+            "model_versions": decision.model_versions,
         },
     }
 
@@ -356,6 +418,52 @@ def request_payload_for_logs(parsed_body: Any) -> Any:
     return {"raw_body": str(parsed_body)}
 
 
+def decision_payload_for_logs(decision: FirewallDecision) -> dict[str, Any]:
+    return {
+        "model_versions": decision.model_versions,
+        "scope": decision.scope.to_dict(),
+        "prompt_injection": decision.prompt_injection.to_dict(),
+        "pii": decision.pii.to_dict(),
+        "attachments": decision.attachments.to_dict(),
+        "llama_guard": decision.llama_guard.to_dict(),
+        "risk": decision.risk.to_dict(),
+    }
+
+
+def log_record_from_decision(
+    *,
+    decision: FirewallDecision,
+    request_body: Any,
+    response_payload: Any,
+) -> FirewallLogRecord:
+    raw_scores = decision_payload_for_logs(decision)
+    return FirewallLogRecord(
+        created_at=datetime.now(timezone.utc).isoformat(),
+        agent_id=decision.agent_id,
+        user_input=decision.latest_user_message,
+        decision=decision.decision,
+        trigger_layer=decision.trigger_layer,
+        scope_score=decision.risk.scope_main,
+        prompt_injection_score=decision.risk.pg2_main,
+        raw_scores=raw_scores,
+        request_payload=sanitize_payload_for_logs(request_payload_for_logs(request_body), decision),
+        response_payload=response_payload,
+        pg2_main=decision.risk.pg2_main,
+        scope_main=decision.risk.scope_main,
+        pii_main=decision.risk.pii_main,
+        doc_pg2_max=decision.risk.doc_pg2_max,
+        doc_scope_min=decision.risk.doc_scope_min,
+        doc_flagged_ratio=decision.risk.doc_flagged_ratio,
+        lg4_unsafe=decision.risk.lg4_unsafe,
+        lg4_code_abuse=decision.risk.lg4_code_abuse,
+        final_risk=decision.risk.final_risk,
+        attachment_summary=decision.attachments.summary,
+        decision_reasons=decision.risk.reasons,
+        chunk_summaries=[chunk.to_log_dict() for chunk in decision.attachments.chunks],
+        model_versions=decision.model_versions,
+    )
+
+
 def match_protected_route(request: Request, config: AppConfig) -> ProtectedRouteConfig | None:
     request_path = request.url.path
     request_method = request.method.upper()
@@ -386,6 +494,7 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(
             asyncio.to_thread(engine.scope_service.initialize),
             asyncio.to_thread(engine.prompt_injection_service.initialize),
+            asyncio.to_thread(engine.pii_service.initialize),
         )
     except Exception:
         await logger.stop()
@@ -485,8 +594,9 @@ async def handle_protected_request(request: Request, route_config: ProtectedRout
                 scope_score=0.0,
                 prompt_injection_score=0.0,
                 raw_scores={"firewall_toggle": {"applied": False, "reason": toggle_reason}},
-                request_payload=request_payload_for_logs(body),
+                request_payload=sanitize_payload_for_logs(request_payload_for_logs(body)),
                 response_payload=upstream_payload,
+                decision_reasons=[toggle_reason],
             )
         )
         log_event(
@@ -543,15 +653,9 @@ async def handle_protected_request(request: Request, route_config: ProtectedRout
         messages_for_scoring = [{"role": "user", "content": latest_user_message}]
 
     try:
-        decision = await asyncio.to_thread(engine.evaluate, agent_id, messages_for_scoring)
-        decision.latest_user_message = latest_user_message
+        decision = await asyncio.to_thread(engine.evaluate, agent_id, messages_for_scoring, body)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    decision_payload = {
-        "scope": decision.scope.to_dict(),
-        "prompt_injection": decision.prompt_injection.to_dict(),
-    }
 
     if decision.decision == "ALLOW":
         try:
@@ -563,16 +667,9 @@ async def handle_protected_request(request: Request, route_config: ProtectedRout
         upstream_payload = parse_response_payload(response_headers, upstream_body)
 
         db_logger.enqueue(
-            FirewallLogRecord(
-                created_at=datetime.now(timezone.utc).isoformat(),
-                agent_id=agent_id,
-                user_input=decision.latest_user_message,
-                decision=decision.decision,
-                trigger_layer=decision.trigger_layer,
-                scope_score=decision.scope.scope_score,
-                prompt_injection_score=decision.prompt_injection.malicious_probability,
-                raw_scores=decision_payload,
-                request_payload=request_payload_for_logs(body),
+            log_record_from_decision(
+                decision=decision,
+                request_body=body,
                 response_payload=upstream_payload,
             )
         )
@@ -581,8 +678,9 @@ async def handle_protected_request(request: Request, route_config: ProtectedRout
             agent_id=agent_id,
             route_name=route_config.name,
             path=request.url.path,
-            scope_score=decision.scope.scope_score,
-            prompt_injection_score=decision.prompt_injection.malicious_probability,
+            scope_main=decision.risk.scope_main,
+            pg2_main=decision.risk.pg2_main,
+            final_risk=decision.risk.final_risk,
         )
         response = build_proxy_response(
             status_code,
@@ -596,16 +694,9 @@ async def handle_protected_request(request: Request, route_config: ProtectedRout
 
     firewall_response = build_firewall_sdk_response(route_config, body, decision)
     db_logger.enqueue(
-        FirewallLogRecord(
-            created_at=datetime.now(timezone.utc).isoformat(),
-            agent_id=agent_id,
-            user_input=decision.latest_user_message,
-            decision=decision.decision,
-            trigger_layer=decision.trigger_layer,
-            scope_score=decision.scope.scope_score,
-            prompt_injection_score=decision.prompt_injection.malicious_probability,
-            raw_scores=decision_payload,
-            request_payload=request_payload_for_logs(body),
+        log_record_from_decision(
+            decision=decision,
+            request_body=body,
             response_payload=firewall_response,
         )
     )
@@ -616,8 +707,9 @@ async def handle_protected_request(request: Request, route_config: ProtectedRout
         path=request.url.path,
         decision=decision.decision,
         trigger_layer=decision.trigger_layer,
-        scope_score=decision.scope.scope_score,
-        prompt_injection_score=decision.prompt_injection.malicious_probability,
+        scope_main=decision.risk.scope_main,
+        pg2_main=decision.risk.pg2_main,
+        final_risk=decision.risk.final_risk,
     )
     response = JSONResponse(status_code=route_config.block_status_code, content=firewall_response)
     response.headers["x-firewall-decision"] = decision.decision
@@ -728,4 +820,10 @@ async def proxy_all(path: str, request: Request) -> Response:
         log_event("upstream.error", path=request.url.path, error=str(exc))
         raise HTTPException(status_code=502, detail=f"Failed to reach upstream endpoint: {exc}") from exc
 
-    return build_proxy_response(status_code, response_headers, upstream_body)
+    return build_proxy_response(
+        status_code,
+        response_headers,
+        upstream_body,
+        firewall_decision="BYPASS",
+        forwarded=True,
+    )

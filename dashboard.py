@@ -34,23 +34,31 @@ def load_logs() -> pd.DataFrame:
     with sqlite3.connect(DB_PATH) as connection:
         frame = pd.read_sql_query(
             """
-            SELECT
-                id,
-                created_at,
-                agent_id,
-                user_input,
-                decision,
-                trigger_layer,
-                scope_score,
-                prompt_injection_score,
-                raw_scores,
-                request_payload,
-                response_payload
+            SELECT *
             FROM firewall_logs
             ORDER BY id DESC
             """,
             connection,
         )
+
+    defaults = {
+        "pg2_main": 0.0,
+        "scope_main": frame.get("scope_score", 0.0),
+        "pii_main": 0.0,
+        "doc_pg2_max": 0.0,
+        "doc_scope_min": 1.0,
+        "doc_flagged_ratio": 0.0,
+        "lg4_unsafe": 0,
+        "lg4_code_abuse": 0,
+        "final_risk": 0.0,
+        "attachment_summary": "{}",
+        "decision_reasons": "[]",
+        "chunk_summaries": "[]",
+        "model_versions": "{}",
+    }
+    for column, default in defaults.items():
+        if column not in frame.columns:
+            frame[column] = default
 
     return frame
 
@@ -638,7 +646,8 @@ bypass_count = int((filtered_logs["decision"] == "BYPASS").sum())
 block_rate = (blocked_count / total_requests) * 100 if total_requests else 0.0
 top_layer = compute_top_trigger_layer(filtered_logs)
 avg_scope = float(filtered_logs["scope_score"].fillna(0).mean())
-avg_injection = float(filtered_logs["prompt_injection_score"].fillna(0).mean())
+avg_injection = float(filtered_logs["pg2_main"].fillna(filtered_logs["prompt_injection_score"]).fillna(0).mean())
+avg_risk = float(filtered_logs["final_risk"].fillna(0).mean())
 
 metric_col_1, metric_col_2, metric_col_3, metric_col_4 = st.columns(4)
 with metric_col_1:
@@ -683,7 +692,8 @@ with analytics_col_2:
     st.markdown('<div class="panel-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-title">Signal Snapshot</div>', unsafe_allow_html=True)
     score_card("Average Scope Score", avg_scope, "#8ab3ff")
-    score_card("Average Injection Score", avg_injection, DECISION_COLORS["WARN"])
+    score_card("Average PG2 Score", avg_injection, DECISION_COLORS["WARN"])
+    score_card("Average Final Risk", avg_risk, DECISION_COLORS["DENY"])
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown('<div class="panel-card">', unsafe_allow_html=True)
@@ -695,8 +705,10 @@ table_columns = [
     "agent_id",
     "decision",
     "trigger_layer",
-    "scope_score",
-    "prompt_injection_score",
+    "scope_main",
+    "pg2_main",
+    "pii_main",
+    "final_risk",
     "user_input",
 ]
 
@@ -707,8 +719,10 @@ table_event = st.dataframe(
     on_select="rerun",
     selection_mode="single-row",
     column_config={
-        "scope_score": st.column_config.NumberColumn(format="%.4f"),
-        "prompt_injection_score": st.column_config.NumberColumn(format="%.4f"),
+        "scope_main": st.column_config.NumberColumn(format="%.4f"),
+        "pg2_main": st.column_config.NumberColumn(format="%.4f"),
+        "pii_main": st.column_config.NumberColumn(format="%.4f"),
+        "final_risk": st.column_config.NumberColumn(format="%.4f"),
         "user_input": st.column_config.TextColumn(width="large"),
     },
 )
@@ -735,8 +749,15 @@ response_payload = safe_json_loads(selected_row["response_payload"])
 
 scope_scores = raw_scores.get("scope", {})
 injection_scores = raw_scores.get("prompt_injection", {})
+pii_scores = raw_scores.get("pii", {})
+attachment_scores = raw_scores.get("attachments", {})
+llama_guard_scores = raw_scores.get("llama_guard", {})
+risk_scores = raw_scores.get("risk", {})
+decision_reasons = safe_json_loads(selected_row.get("decision_reasons", "[]"))
+chunk_summaries = safe_json_loads(selected_row.get("chunk_summaries", "[]"))
+model_versions = safe_json_loads(selected_row.get("model_versions", "{}"))
 
-overview_col, scope_col, injection_col = st.columns([0.9, 1, 1])
+overview_col, layer_col, scope_col, injection_col = st.columns([0.9, 1, 1, 1])
 with overview_col:
     st.markdown(
         '<div class="summary-grid">'
@@ -745,14 +766,25 @@ with overview_col:
         + summary_item("Decision", selected_row["decision"])
         + summary_item("Trigger Layer", selected_row["trigger_layer"])
         + summary_item("Created", selected_row["created_at"])
+        + summary_item("Final Risk", f'{clamp_score(selected_row.get("final_risk", 0.0)):.4f}')
         + summary_item("Prompt", selected_row["user_input"])
         + "</div>",
         unsafe_allow_html=True,
     )
 
+with layer_col:
+    st.markdown("**Layer Results**")
+    score_card("L0 Scope Main", risk_scores.get("scope_main", selected_row.get("scope_main", 0.0)), "#8ab3ff")
+    score_card("L1 PG2 Main", risk_scores.get("pg2_main", selected_row.get("pg2_main", 0.0)), DECISION_COLORS["WARN"])
+    score_card("L2 PII Main", risk_scores.get("pii_main", selected_row.get("pii_main", 0.0)), "#f6f8ff")
+    score_card("Final Risk", risk_scores.get("final_risk", selected_row.get("final_risk", 0.0)), DECISION_COLORS["DENY"])
+    st.caption("Layers executed")
+    st.code(", ".join(risk_scores.get("layers_executed", [])), language="text")
+
 with scope_col:
     st.markdown("**Scope Check**")
     score_card("Combined Scope Score", scope_scores.get("scope_score", 0.0), "#8ab3ff")
+    score_card("Raw Scope Formula", scope_scores.get("raw_scope_score", 0.0), "#77b0ff")
     score_card("Description Similarity", scope_scores.get("description_similarity", 0.0), "#77b0ff")
     score_card("Allowed Max Similarity", scope_scores.get("allowed_max_similarity", 0.0), DECISION_COLORS["ALLOW"])
     score_card("Denied Max Similarity", scope_scores.get("denied_max_similarity", 0.0), DECISION_COLORS["DENY"])
@@ -773,10 +805,43 @@ with injection_col:
         injection_scores.get("benign_probability", 0.0),
         DECISION_COLORS["ALLOW"],
     )
-    st.caption("Classifier context")
+    score_card("Attachment PG2 Max", attachment_scores.get("doc_pg2_max", 0.0), DECISION_COLORS["WARN"])
+    score_card("Attachment Scope Min", attachment_scores.get("doc_scope_min", 1.0), "#8ab3ff")
+    st.caption("Prompt Guard context")
     st.code(injection_scores.get("recent_context", ""), language="text")
 
 st.markdown("</div>", unsafe_allow_html=True)
+
+st.markdown('<div class="panel-card">', unsafe_allow_html=True)
+st.markdown('<div class="section-title">Decision Reasons And L3/L4 Findings</div>', unsafe_allow_html=True)
+reason_values = decision_reasons if isinstance(decision_reasons, list) else risk_scores.get("reasons", [])
+if reason_values:
+    for reason in reason_values:
+        st.write(f"- {reason}")
+else:
+    st.caption("No warning or deny reason recorded.")
+
+detail_col_1, detail_col_2, detail_col_3 = st.columns(3)
+with detail_col_1:
+    st.markdown("**PII Summary**")
+    st.json(pii_scores or {"severity": selected_row.get("pii_main", 0.0)})
+with detail_col_2:
+    st.markdown("**Attachment Summary**")
+    st.json(attachment_scores.get("summary", safe_json_loads(selected_row.get("attachment_summary", "{}"))))
+with detail_col_3:
+    st.markdown("**Llama Guard 4**")
+    st.json(llama_guard_scores or {"lg4_unsafe": selected_row.get("lg4_unsafe", 0)})
+st.markdown("</div>", unsafe_allow_html=True)
+
+with st.expander("Chunk-Level Findings", expanded=False):
+    chunks = chunk_summaries if isinstance(chunk_summaries, list) and chunk_summaries else attachment_scores.get("chunks", [])
+    if chunks:
+        st.dataframe(pd.DataFrame(chunks), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No text attachment chunks were logged for this request.")
+
+with st.expander("Model Versions", expanded=False):
+    st.json(model_versions or raw_scores.get("model_versions", {}))
 
 with st.expander("Raw Scores JSON", expanded=False):
     st.json(raw_scores)

@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local runtime state and logs
+firewall_logs.db
+firewall_logs.db-*
+firewall_runtime_state.json
+*.log
+
+# Local model/checkpoint artifacts
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+checklist.chk
+direct_prompt_classifier_neuralchemy/
+
+# Dashboard/assets generated locally
+.streamlit/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+~$*

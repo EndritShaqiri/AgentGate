@@ -22,23 +22,38 @@ class AgentConfig:
 @dataclass(slots=True)
 class ModelConfig:
     scope_model_name: str
-    prompt_injection_model_path: Path
-    classifier_max_length: int
+    prompt_guard_model_name: str
+    prompt_guard_max_length: int
+    prompt_guard_malicious_label: str
+    pii_model_name: str
+    pii_enabled: bool
+    llama_guard_model_name: str
+    llama_guard_max_new_tokens: int
+    llama_guard_fail_closed: bool
     include_recent_context: bool
     recent_context_messages: int
     recent_context_chars: int
-    malicious_label_index: int
     device: str
+    attachment_chunk_chars: int
+    attachment_chunk_overlap: int
+    attachment_max_pages: int
+    attachment_max_lg4_images: int
 
 
 @dataclass(slots=True)
 class ThresholdConfig:
-    prompt_injection_deny: float
+    pg2_warn: float
+    pg2_deny: float
     scope_warn: float
     scope_deny: float
+    doc_pg2_warn: float
+    doc_pg2_deny: float
+    doc_scope_deny: float
+    doc_flagged_ratio_warn: float
+    final_warn: float
+    final_deny: float
+    pii_high: float
     denied_similarity_weight: float
-    require_suspicious_pattern_for_prompt_injection_deny: bool
-    suspicious_prompt_injection_patterns: list[str]
 
 
 @dataclass(slots=True)
@@ -188,31 +203,40 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         default_agent=raw["default_agent"],
         models=ModelConfig(
             scope_model_name=raw["models"]["scope_model_name"],
-            prompt_injection_model_path=_resolve_path(raw["models"]["prompt_injection_model_path"]),
-            classifier_max_length=int(raw["models"]["classifier_max_length"]),
-            include_recent_context=bool(raw["models"]["include_recent_context"]),
-            recent_context_messages=int(raw["models"]["recent_context_messages"]),
-            recent_context_chars=int(raw["models"]["recent_context_chars"]),
-            malicious_label_index=int(raw["models"]["malicious_label_index"]),
-            device=raw["models"]["device"],
+            prompt_guard_model_name=str(
+                raw["models"].get("prompt_guard_model_name", "meta-llama/Llama-Prompt-Guard-2-86M")
+            ),
+            prompt_guard_max_length=int(raw["models"].get("prompt_guard_max_length", 512)),
+            prompt_guard_malicious_label=str(raw["models"].get("prompt_guard_malicious_label", "MALICIOUS")),
+            pii_model_name=str(raw["models"].get("pii_model_name", "dslim/bert-base-NER")),
+            pii_enabled=bool(raw["models"].get("pii_enabled", True)),
+            llama_guard_model_name=str(
+                raw["models"].get("llama_guard_model_name", "meta-llama/Llama-Guard-4-12B")
+            ),
+            llama_guard_max_new_tokens=int(raw["models"].get("llama_guard_max_new_tokens", 32)),
+            llama_guard_fail_closed=bool(raw["models"].get("llama_guard_fail_closed", True)),
+            include_recent_context=bool(raw["models"].get("include_recent_context", False)),
+            recent_context_messages=int(raw["models"].get("recent_context_messages", 3)),
+            recent_context_chars=int(raw["models"].get("recent_context_chars", 600)),
+            device=raw["models"].get("device", "auto"),
+            attachment_chunk_chars=int(raw["models"].get("attachment_chunk_chars", 1800)),
+            attachment_chunk_overlap=int(raw["models"].get("attachment_chunk_overlap", 240)),
+            attachment_max_pages=int(raw["models"].get("attachment_max_pages", 12)),
+            attachment_max_lg4_images=int(raw["models"].get("attachment_max_lg4_images", 4)),
         ),
         thresholds=ThresholdConfig(
-            prompt_injection_deny=float(raw["thresholds"]["prompt_injection_deny"]),
-            scope_warn=float(raw["thresholds"]["scope_warn"]),
-            scope_deny=float(raw["thresholds"]["scope_deny"]),
+            pg2_warn=float(raw["thresholds"].get("pg2_warn", 0.75)),
+            pg2_deny=float(raw["thresholds"].get("pg2_deny", 0.90)),
+            scope_warn=float(raw["thresholds"].get("scope_warn", 0.45)),
+            scope_deny=float(raw["thresholds"].get("scope_deny", 0.30)),
+            doc_pg2_warn=float(raw["thresholds"].get("doc_pg2_warn", 0.75)),
+            doc_pg2_deny=float(raw["thresholds"].get("doc_pg2_deny", 0.90)),
+            doc_scope_deny=float(raw["thresholds"].get("doc_scope_deny", 0.25)),
+            doc_flagged_ratio_warn=float(raw["thresholds"].get("doc_flagged_ratio_warn", 0.15)),
+            final_warn=float(raw["thresholds"].get("final_warn", 0.60)),
+            final_deny=float(raw["thresholds"].get("final_deny", 0.78)),
+            pii_high=float(raw["thresholds"].get("pii_high", 0.70)),
             denied_similarity_weight=float(raw["thresholds"]["denied_similarity_weight"]),
-            require_suspicious_pattern_for_prompt_injection_deny=bool(
-                raw["thresholds"].get(
-                    "require_suspicious_pattern_for_prompt_injection_deny",
-                    True,
-                )
-            ),
-            suspicious_prompt_injection_patterns=list(
-                raw["thresholds"].get(
-                    "suspicious_prompt_injection_patterns",
-                    [],
-                )
-            ),
         ),
         database=DatabaseConfig(
             path=_resolve_path(raw["database"]["path"]),
