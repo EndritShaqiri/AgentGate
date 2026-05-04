@@ -69,12 +69,25 @@ The dashboard prompts for one runtime setup that contains both the protected age
 - `description`
 - `allowed_examples`
 - `denied_examples`
+- `tool_registry`
 - `use_local_mock`
 - `base_url`
 - `timeout_seconds`
 - `default_model`
 
-This single row is saved to SQLite and read by FastAPI before protected requests. The MiniLM semantic scope cache is rebuilt from that row, and allowed requests are forwarded using the upstream settings in that same row.
+This single row is saved to SQLite and read by FastAPI before protected requests. The MiniLM semantic scope cache is rebuilt from that row, allowed requests are forwarded using the upstream settings in that same row, and exact tool names are preserved for future policy generation.
+
+For tools, exact names are enough when the name describes the function:
+
+- `search_massachusetts_law`
+- `summarize_uploaded_pdf`
+- `send_email`
+
+If the name is ambiguous, add a short purpose:
+
+- `tool_A | external_action | Send generated summaries to the configured recipient`
+
+Optional richer format is `tool_name | category | purpose | risk`.
 
 If `use_local_mock` is on, legitimate allowed requests intentionally return the built-in mock response. To get a real chatbot answer, turn local mock off and enter the real upstream base URL, such as:
 

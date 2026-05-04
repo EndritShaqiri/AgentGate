@@ -14,7 +14,9 @@ import streamlit as st
 from firewall_proxy.config import load_config
 from firewall_proxy.runtime_config_store import (
     clear_runtime_agent_setup,
+    format_tool_registry,
     load_runtime_agent_setup,
+    parse_tool_registry,
     split_examples,
     upsert_runtime_agent_setup,
 )
@@ -566,6 +568,8 @@ def load_dashboard_runtime_setup_values() -> dict[str, Any]:
             "description": setup.description,
             "allowed_examples": "\n".join(setup.allowed_examples),
             "denied_examples": "\n".join(setup.denied_examples),
+            "tool_registry": format_tool_registry(setup.tool_registry),
+            "tool_count": len(setup.tool_registry),
             "use_local_mock": setup.use_local_mock,
             "base_url": setup.base_url or "",
             "timeout_seconds": setup.timeout_seconds,
@@ -581,6 +585,8 @@ def load_dashboard_runtime_setup_values() -> dict[str, Any]:
         "description": "",
         "allowed_examples": "",
         "denied_examples": "",
+        "tool_registry": "",
+        "tool_count": 0,
         "use_local_mock": fallback.upstream.use_local_mock,
         "base_url": fallback.upstream.base_url or "",
         "timeout_seconds": fallback.upstream.timeout_seconds,
@@ -614,6 +620,7 @@ def render_runtime_agent_setup_editor() -> None:
             + summary_item("Forwarding Mode", mode_label)
             + summary_item("Upstream Base URL", base_url_label)
             + summary_item("Default Model", values["default_model"])
+            + summary_item("Registered Tools", values["tool_count"])
             + "</div>",
             unsafe_allow_html=True,
         )
@@ -657,6 +664,26 @@ def render_runtime_agent_setup_editor() -> None:
                 value=str(values["denied_examples"]),
                 height=150,
                 placeholder="One denied, unsafe, or out-of-scope request per line.",
+            )
+            tool_registry_raw = st.text_area(
+                "Allowed tool names",
+                value=str(values["tool_registry"]),
+                height=125,
+                placeholder=(
+                    "search_massachusetts_law\n"
+                    "summarize_uploaded_pdf\n"
+                    "send_email\n"
+                    "tool_A | external_action | Send summaries to the configured recipient"
+                ),
+                help=(
+                    "Exact names are enough when they describe the function. "
+                    "For generic names like tool_A, add: name | category | short purpose | risk."
+                ),
+            )
+            st.warning(
+                "If the tool name clearly describes its function, like `send_email`, no description is needed. "
+                "If it is generic, like `tool_A`, add one short sentence explaining what it does.",
+                icon="⚠️",
             )
 
         with upstream_col:
@@ -705,6 +732,7 @@ def render_runtime_agent_setup_editor() -> None:
                 description=description,
                 allowed_examples=split_examples(allowed_raw),
                 denied_examples=split_examples(denied_raw),
+                tool_registry=parse_tool_registry(tool_registry_raw),
                 use_local_mock=use_local_mock,
                 base_url=base_url,
                 timeout_seconds=timeout_seconds,
