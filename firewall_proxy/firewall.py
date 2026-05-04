@@ -18,6 +18,10 @@ from firewall_proxy.attachments import (
     extract_attachments_from_body,
 )
 from firewall_proxy.config import AgentConfig, AppConfig
+from firewall_proxy.runtime_config_store import (
+    get_runtime_agent_setup_versions,
+    load_runtime_agent_setup,
+)
 
 
 STRUCTURED_PII_PATTERNS = {
@@ -599,6 +603,8 @@ class ScopeService:
         self._config = config
         self._model: SentenceTransformer | None = None
         self._cache: dict[str, AgentEmbeddingCache] = {}
+        self._profile_versions: dict[str, str] = {}
+        self._cache_lock = threading.RLock()
 
     @property
     def model_name(self) -> str:
@@ -609,11 +615,36 @@ class ScopeService:
             self._config.models.scope_model_name,
             device=self._resolve_device(),
         )
+        self._model = model
+        self.rebuild_agent_cache()
+        self._profile_versions = get_runtime_agent_setup_versions(self._config.database.path)
 
+    def refresh_profiles_if_changed(self) -> None:
+        latest_versions = get_runtime_agent_setup_versions(self._config.database.path)
+        if latest_versions == self._profile_versions:
+            return
+
+        setup = load_runtime_agent_setup(self._config.database.path)
+        if setup is None:
+            self._config.agents = {}
+        else:
+            self._config.default_agent = setup.agent_id
+            self._config.agents = {setup.agent_id: setup.to_agent_config()}
+        self.rebuild_agent_cache()
+        self._profile_versions = latest_versions
+
+    def rebuild_agent_cache(self) -> None:
+        if self._model is None:
+            raise RuntimeError("Scope model has not been initialized.")
+
+        with self._cache_lock:
+            self._cache = self._build_cache()
+
+    def _build_cache(self) -> dict[str, AgentEmbeddingCache]:
         cache: dict[str, AgentEmbeddingCache] = {}
         for agent_id, agent in self._config.agents.items():
             texts = [agent.description, *agent.allowed_examples, *agent.denied_examples]
-            embeddings = model.encode(
+            embeddings = self._model.encode(
                 texts,
                 convert_to_numpy=True,
                 normalize_embeddings=True,
@@ -632,8 +663,7 @@ class ScopeService:
                 denied_examples=agent.denied_examples,
             )
 
-        self._model = model
-        self._cache = cache
+        return cache
 
     def _resolve_device(self) -> str:
         configured = self._config.models.device.lower()
@@ -645,7 +675,9 @@ class ScopeService:
         return self.score_many(agent_id, [user_text])[0]
 
     def score_many(self, agent_id: str, texts: list[str]) -> list[ScopeEvaluation]:
-        if self._model is None or agent_id not in self._cache:
+        with self._cache_lock:
+            cache = self._cache.get(agent_id)
+        if self._model is None or cache is None:
             raise RuntimeError("Scope service has not been initialized.")
         if not texts:
             return []
@@ -655,7 +687,6 @@ class ScopeService:
             convert_to_numpy=True,
             normalize_embeddings=True,
         )
-        cache = self._cache[agent_id]
         return [self._build_evaluation(agent_id, cache, embedding) for embedding in user_embeddings]
 
     def _build_evaluation(
@@ -1171,6 +1202,7 @@ class FirewallEngine:
         messages: list[dict[str, Any]],
         request_body: Any | None = None,
     ) -> FirewallDecision:
+        self.scope_service.refresh_profiles_if_changed()
         self.validate_agent(agent_id)
         latest_user_message = normalize_user_message(extract_latest_user_message(messages))
         request_body = request_body or {}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import base64
 import html
 import json
@@ -10,6 +11,13 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from firewall_proxy.config import load_config
+from firewall_proxy.runtime_config_store import (
+    clear_runtime_agent_setup,
+    load_runtime_agent_setup,
+    split_examples,
+    upsert_runtime_agent_setup,
+)
 from firewall_proxy.runtime_state import is_global_firewall_enabled, set_global_firewall_enabled
 
 
@@ -548,7 +556,187 @@ def decision_badge(decision: str) -> str:
     )
 
 
+def load_dashboard_runtime_setup_values() -> dict[str, Any]:
+    setup = load_runtime_agent_setup(DB_PATH)
+    if setup is not None:
+        return {
+            "configured": True,
+            "source": "Dashboard SQLite runtime setup",
+            "agent_id": setup.agent_id,
+            "description": setup.description,
+            "allowed_examples": "\n".join(setup.allowed_examples),
+            "denied_examples": "\n".join(setup.denied_examples),
+            "use_local_mock": setup.use_local_mock,
+            "base_url": setup.base_url or "",
+            "timeout_seconds": setup.timeout_seconds,
+            "default_model": setup.default_model,
+            "updated_at": setup.updated_at,
+        }
+
+    fallback = load_config()
+    return {
+        "configured": False,
+        "source": "Not configured yet",
+        "agent_id": "",
+        "description": "",
+        "allowed_examples": "",
+        "denied_examples": "",
+        "use_local_mock": fallback.upstream.use_local_mock,
+        "base_url": fallback.upstream.base_url or "",
+        "timeout_seconds": fallback.upstream.timeout_seconds,
+        "default_model": fallback.upstream.default_model,
+        "updated_at": "This local session starts empty.",
+    }
+
+
+def render_runtime_agent_setup_editor() -> None:
+    values = load_dashboard_runtime_setup_values()
+    mode_label = "Local mock" if values["use_local_mock"] else "Remote upstream"
+    base_url_label = values["base_url"] or "Internal /mock routes"
+
+    st.markdown('<div class="panel-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Runtime Agent Setup</div>', unsafe_allow_html=True)
+    st.caption(
+        "Fill this once per local demo run. The dashboard saves one SQLite runtime row containing "
+        "both the scope profile and the upstream target, and FastAPI reloads that same row before requests."
+    )
+
+    if not values["configured"]:
+        st.warning(
+            "No runtime setup is active yet. Save this form before sending protected requests."
+        )
+
+    status_col_1, status_col_2 = st.columns([0.58, 0.42])
+    with status_col_1:
+        st.markdown(
+            '<div class="summary-grid">'
+            + summary_item("Agent ID", values["agent_id"] or "Not set")
+            + summary_item("Forwarding Mode", mode_label)
+            + summary_item("Upstream Base URL", base_url_label)
+            + summary_item("Default Model", values["default_model"])
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+    with status_col_2:
+        st.markdown(
+            '<div class="summary-grid">'
+            + summary_item("Settings Source", values["source"])
+            + summary_item("Updated", values["updated_at"])
+            + summary_item("Timeout", f'{float(values["timeout_seconds"]):.1f}s')
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+        st.info(
+            "If local mock is ON, allowed requests intentionally return a mock reply. "
+            "Turn it OFF and enter your real upstream URL to get real chatbot answers."
+        )
+
+    with st.form("runtime_agent_setup_form", clear_on_submit=False):
+        scope_col, upstream_col = st.columns([0.54, 0.46])
+        with scope_col:
+            agent_id = st.text_input(
+                "Agent ID",
+                value=str(values["agent_id"]),
+                placeholder="star",
+                help="Requests can select this with `x-agent-id`, top-level `agent_id`, or metadata.",
+            )
+            description = st.text_area(
+                "Description",
+                value=str(values["description"]),
+                height=150,
+                placeholder="Describe what this protected agent is allowed to do.",
+            )
+            allowed_raw = st.text_area(
+                "Allowed examples",
+                value=str(values["allowed_examples"]),
+                height=150,
+                placeholder="One legitimate user request per line.",
+            )
+            denied_raw = st.text_area(
+                "Denied examples",
+                value=str(values["denied_examples"]),
+                height=150,
+                placeholder="One denied, unsafe, or out-of-scope request per line.",
+            )
+
+        with upstream_col:
+            use_local_mock = st.toggle(
+                "Use local mock upstream",
+                value=bool(values["use_local_mock"]),
+                help="When enabled, allowed requests go to the built-in /mock endpoints.",
+            )
+            base_url = st.text_input(
+                "Remote upstream base URL",
+                value=str(values["base_url"]),
+                placeholder="https://api.openai.com/v1 or http://127.0.0.1:1234/v1",
+                help="Required when local mock mode is off. Do not point this at the dashboard or firewall.",
+            )
+            timeout_seconds = st.number_input(
+                "Timeout seconds",
+                min_value=1.0,
+                max_value=300.0,
+                value=float(values["timeout_seconds"]),
+                step=1.0,
+            )
+            default_model = st.text_input(
+                "Default model",
+                value=str(values["default_model"]),
+                placeholder="gpt-4.1-mini, local-demo-model, or mock-guarded-model",
+            )
+            st.caption(
+                "Forwarded requests keep the original path, query string, body, and auth headers."
+            )
+
+        save_col, clear_col, hint_col = st.columns([0.18, 0.18, 0.64])
+        with save_col:
+            save_clicked = st.form_submit_button("Save Setup", type="primary", use_container_width=True)
+        with clear_col:
+            clear_clicked = st.form_submit_button("Clear Setup", use_container_width=True)
+        with hint_col:
+            st.caption(
+                "This runtime setup is intentionally ephemeral: normal FastAPI or dashboard shutdown clears it."
+            )
+
+    if save_clicked:
+        try:
+            saved = upsert_runtime_agent_setup(
+                DB_PATH,
+                agent_id=agent_id,
+                description=description,
+                allowed_examples=split_examples(allowed_raw),
+                denied_examples=split_examples(denied_raw),
+                use_local_mock=use_local_mock,
+                base_url=base_url,
+                timeout_seconds=timeout_seconds,
+                default_model=default_model,
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            mode = "local mock" if saved.use_local_mock else "remote upstream"
+            st.success(
+                f"Saved `{saved.agent_id}` with {mode}. The firewall will use it on the next request."
+            )
+            st.rerun()
+
+    if clear_clicked:
+        clear_runtime_agent_setup(DB_PATH)
+        st.warning("Cleared the runtime setup. Protected requests will pause until you save a new one.")
+        st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
 st.set_page_config(page_title="AI Firewall Dashboard", layout="wide")
+
+
+@st.cache_resource
+def register_runtime_cleanup(db_path_value: str) -> bool:
+    atexit.register(clear_runtime_agent_setup, Path(db_path_value))
+    return True
+
+
+register_runtime_cleanup(str(DB_PATH))
 inject_styles()
 slashid_logo_src = image_data_uri(SLASHID_LOGO_DARK_PATH)
 
@@ -610,6 +798,8 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+render_runtime_agent_setup_editor()
 
 logs = load_logs()
 if logs.empty:

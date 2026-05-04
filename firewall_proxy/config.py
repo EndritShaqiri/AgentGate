@@ -172,7 +172,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             allowed_examples=list(agent_values.get("allowed_examples", [])),
             denied_examples=list(agent_values.get("denied_examples", [])),
         )
-        for agent_id, agent_values in raw["agents"].items()
+        for agent_id, agent_values in raw.get("agents", {}).items()
     }
 
     firewall_values = raw.get("firewall", {})

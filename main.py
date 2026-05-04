@@ -26,6 +26,7 @@ from firewall_proxy.firewall import (
     normalize_user_message,
 )
 from firewall_proxy.log_store import AsyncSQLiteLogger, FirewallLogRecord
+from firewall_proxy.runtime_config_store import clear_runtime_agent_setup, load_runtime_agent_setup
 from firewall_proxy.runtime_state import is_global_firewall_enabled
 
 
@@ -235,6 +236,14 @@ def resolve_agent_id(body: Any, request: Request, config: AppConfig) -> str:
 
     if requested_agent not in config.agents:
         available = ", ".join(sorted(config.agents))
+        if not available:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unknown agent_id '{requested_agent}'. No runtime agent setup is configured yet. "
+                    "Create one in the dashboard Runtime Agent Setup panel first."
+                ),
+            )
         raise HTTPException(
             status_code=400,
             detail=f"Unknown agent_id '{requested_agent}'. Available agents: {available}",
@@ -481,10 +490,23 @@ def configured_protected_endpoints(config: AppConfig) -> list[str]:
     return sorted(f"{','.join(route.methods)} {route.path_pattern}" for route in config.firewall.protected_routes)
 
 
+def refresh_runtime_agent_setup(config: AppConfig) -> bool:
+    setup = load_runtime_agent_setup(config.database.path)
+    if setup is None:
+        config.agents = {}
+        return False
+
+    config.default_agent = setup.agent_id
+    config.agents = {setup.agent_id: setup.to_agent_config()}
+    config.upstream = setup.to_upstream_config()
+    return True
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config = load_config()
     configure_logging(config.logging.level)
+    runtime_setup_configured = refresh_runtime_agent_setup(config)
 
     engine = FirewallEngine(config)
     logger = AsyncSQLiteLogger(config.database.path, config.database.max_rows)
@@ -508,6 +530,7 @@ async def lifespan(app: FastAPI):
         "startup.complete",
         default_agent=config.default_agent,
         agents=list(config.agents),
+        runtime_setup_configured=runtime_setup_configured,
         database_path=str(config.database.path),
     )
 
@@ -515,6 +538,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await logger.stop()
+        clear_runtime_agent_setup(config.database.path)
         log_event("shutdown.complete")
 
 
@@ -524,10 +548,16 @@ app = FastAPI(title="AI Firewall Proxy", version="1.0.0", lifespan=lifespan)
 @app.get("/")
 async def root() -> dict[str, Any]:
     config: AppConfig = app.state.config
+    runtime_setup_configured = refresh_runtime_agent_setup(config)
+    app.state.engine.scope_service.refresh_profiles_if_changed()
     return {
         "service": "ai_firewall_proxy",
         "status": "ok",
+        "runtime_setup_configured": runtime_setup_configured,
         "default_agent": config.default_agent,
+        "upstream_mode": "local_mock" if config.upstream.use_local_mock else "remote",
+        "upstream_base_url": config.upstream.base_url,
+        "upstream_default_model": config.upstream.default_model,
         "protected_endpoints": configured_protected_endpoints(config),
         "request_toggle_enabled": config.firewall.request_toggle_enabled,
         "global_firewall_enabled": is_global_firewall_enabled(),
@@ -537,10 +567,16 @@ async def root() -> dict[str, Any]:
 @app.get("/health")
 async def health() -> dict[str, Any]:
     config: AppConfig = app.state.config
+    runtime_setup_configured = refresh_runtime_agent_setup(config)
+    app.state.engine.scope_service.refresh_profiles_if_changed()
     return {
         "status": "ok",
+        "runtime_setup_configured": runtime_setup_configured,
         "default_agent": config.default_agent,
         "agents": list(config.agents),
+        "upstream_mode": "local_mock" if config.upstream.use_local_mock else "remote",
+        "upstream_base_url": config.upstream.base_url,
+        "upstream_default_model": config.upstream.default_model,
         "database": str(config.database.path),
         "protected_endpoints": configured_protected_endpoints(config),
         "request_toggle_enabled": config.firewall.request_toggle_enabled,
@@ -557,6 +593,8 @@ async def handle_protected_request(request: Request, route_config: ProtectedRout
     engine: FirewallEngine = app.state.engine
     db_logger: AsyncSQLiteLogger = app.state.db_logger
 
+    refresh_runtime_agent_setup(config)
+    engine.scope_service.refresh_profiles_if_changed()
     agent_id = resolve_agent_id(body, request, config)
     should_protect, toggle_reason = should_apply_firewall(body=body, request=request, config=config)
 
@@ -720,6 +758,7 @@ async def handle_protected_request(request: Request, route_config: ProtectedRout
 
 @app.post("/mock/v1/chat/completions", name="mock_chat_completions")
 async def mock_chat_completions(request: Request) -> dict[str, Any]:
+    refresh_runtime_agent_setup(app.state.config)
     body = await request.json()
     messages = body.get("messages", [])
     try:
@@ -731,7 +770,8 @@ async def mock_chat_completions(request: Request) -> dict[str, Any]:
 
     model_name = body.get("model") or app.state.config.upstream.default_model
     response_text = (
-        "Mock upstream reply. Configure a real upstream URL to receive your chatbot's "
+        "Mock upstream reply because local mock mode is enabled. Turn it off in the dashboard "
+        "Runtime Agent Setup panel and enter a real upstream base URL to receive your chatbot's "
         f"actual answer. Latest user message: {latest_user_message[:240]}"
     )
     prompt_tokens = len(json.dumps(messages))
@@ -762,6 +802,7 @@ async def mock_chat_completions(request: Request) -> dict[str, Any]:
 
 @app.post("/mock/v1/responses", name="mock_responses")
 async def mock_responses(request: Request) -> dict[str, Any]:
+    refresh_runtime_agent_setup(app.state.config)
     body = await request.json()
     try:
         latest_user_message = normalize_user_message(
@@ -772,7 +813,8 @@ async def mock_responses(request: Request) -> dict[str, Any]:
 
     model_name = body.get("model") or app.state.config.upstream.default_model
     response_text = (
-        "Mock upstream reply. Configure a real upstream base URL to receive your agent's "
+        "Mock upstream reply because local mock mode is enabled. Turn it off in the dashboard "
+        "Runtime Agent Setup panel and enter a real upstream base URL to receive your agent's "
         f"actual answer. Latest user message: {latest_user_message[:240]}"
     )
     output_tokens = len(response_text.split())
@@ -809,6 +851,7 @@ async def mock_responses(request: Request) -> dict[str, Any]:
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def proxy_all(path: str, request: Request) -> Response:
     config: AppConfig = app.state.config
+    refresh_runtime_agent_setup(config)
     route_config = match_protected_route(request, config)
 
     if route_config is not None:

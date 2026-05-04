@@ -38,7 +38,7 @@ All requests are logged asynchronously to `firewall_logs.db` with SQLite retenti
 
 - `main.py`: FastAPI proxy, OpenAI-compatible block responses, and mocked upstream endpoints
 - `dashboard.py`: Streamlit dashboard for log analysis
-- `config.yaml`: agent definitions and thresholds
+- `config.yaml`: model, route, threshold, upstream, and database settings
 - `firewall_proxy/`: config loading, scoring logic, and async SQLite logger
 
 ## Setup
@@ -61,15 +61,28 @@ pip install -r requirements.txt
 
 The first run may download local model weights from Hugging Face if they are not already cached. Llama Prompt Guard 2 and Llama Guard 4 are Meta Llama models and may require accepting the model license and authenticating with Hugging Face before local loading. `accelerate` and `hf_xet` are included for local Llama Guard 4 loading. The firewall does not call external inference APIs.
 
-## Configure The Upstream
+## Configure Runtime Agent Setup In The Dashboard
 
-In `config.yaml`, set `upstream.base_url` to the real model backend. Do not point it back at the agent UI or app server.
+The dashboard prompts for one runtime setup that contains both the protected agent scope and the forwarding target:
 
-Examples:
+- `agent_id`
+- `description`
+- `allowed_examples`
+- `denied_examples`
+- `use_local_mock`
+- `base_url`
+- `timeout_seconds`
+- `default_model`
 
-- `https://api.openai.com`
-- `http://127.0.0.1:11434`
-- `http://127.0.0.1:1234`
+This single row is saved to SQLite and read by FastAPI before protected requests. The MiniLM semantic scope cache is rebuilt from that row, and allowed requests are forwarded using the upstream settings in that same row.
+
+If `use_local_mock` is on, legitimate allowed requests intentionally return the built-in mock response. To get a real chatbot answer, turn local mock off and enter the real upstream base URL, such as:
+
+- `https://api.openai.com/v1`
+- `http://127.0.0.1:11434/v1`
+- `http://127.0.0.1:1234/v1`
+
+Do not point the upstream base URL back at the dashboard, the agent UI, or the firewall itself.
 
 ## Configure Protected Workflows
 
@@ -141,6 +154,8 @@ curl http://127.0.0.1:8000/health
 streamlit run dashboard.py
 ```
 
+Use `Runtime Agent Setup` at the top of the dashboard before sending demo traffic. The setup is ephemeral for local demos: normal FastAPI or dashboard shutdown clears the saved runtime row.
+
 ## Example Requests
 
 Allowed request:
@@ -211,10 +226,11 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions `
 For most teams, integration is:
 
 1. Point the existing client base URL at the firewall.
-2. Keep the real provider URL in `upstream.base_url`.
-3. Send an agent identifier with `x-agent-id`, top-level `agent_id`, or `metadata.agent_id`.
-4. Optionally send a request toggle such as `x-slashid-firewall: off` to bypass protection for a call.
-5. Add or adjust a protected route rule only if the app uses a non-standard request shape.
+2. Fill `Runtime Agent Setup` in the dashboard.
+3. Turn local mock off and enter the real upstream base URL if you want real chatbot answers.
+4. Send an agent identifier with `x-agent-id`, top-level `agent_id`, or `metadata.agent_id`.
+5. Optionally send a request toggle such as `x-slashid-firewall: off` to bypass protection for a call.
+6. Add or adjust a protected route rule only if the app uses a non-standard request shape.
 
 Examples:
 
@@ -231,5 +247,7 @@ Examples:
 - Generic routes can return a normal JSON block object with a configurable HTTP status code.
 - The local mock upstream is exposed at `/mock/v1/chat/completions` and `/mock/v1/responses`.
 - Clients can select an agent via `x-agent-id`, top-level `agent_id`, or `metadata.agent_id`.
+- The runtime agent setup is stored in SQLite, edited from the dashboard, and cleared on normal dashboard or FastAPI shutdown.
+- `config.yaml` no longer contains hardcoded descriptions, examples, or a real upstream URL. It only keeps model, route, threshold, database, and safe fallback settings.
 - Inline attachment payloads are inspected locally when present. Remote URLs and provider `file_id` references are not fetched by the firewall.
 - Llama Guard 4 is lazy-loaded and only used for multimodal or code-execution/tool-misuse paths. By default, required L4 failures fail closed for those paths.
