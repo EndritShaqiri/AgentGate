@@ -77,6 +77,8 @@ The dashboard prompts for one runtime setup that contains both the protected age
 
 This single row is saved to SQLite and read by FastAPI before protected requests. The MiniLM semantic scope cache is rebuilt from that row, allowed requests are forwarded using the upstream settings in that same row, and exact tool names are preserved for future policy generation.
 
+After saving the runtime setup, the dashboard generates a reviewable PBAC policy draft from the description, allowed examples, denied examples, and exact tool registry. The policy stays inactive until an operator presses `ACCEPT`; operators can also press `EDIT`, modify the JSON, and then accept the edited policy. Accepted policies are stored in SQLite separately from firewall logs and runtime setup.
+
 For tools, exact names are enough when the name describes the function:
 
 - `search_massachusetts_law`
@@ -96,6 +98,42 @@ If `use_local_mock` is on, legitimate allowed requests intentionally return the 
 - `http://127.0.0.1:1234/v1`
 
 Do not point the upstream base URL back at the dashboard, the agent UI, or the firewall itself.
+
+## PBAC And Tool Gateway Access
+
+PBAC is a separate structural plane from the L0-L4 content firewall. It does not read, write, or blend with cosine-similarity scores, Prompt Guard probabilities, PII severity, Llama Guard output, or final fused risk.
+
+For protected requests, the proxy order is:
+
+1. Match the protected route.
+2. Run PBAC against the accepted policy for the current runtime setup. PBAC checks declared tools and infers obvious requested tool intents such as document processing, external email actions, retrieval, and code execution.
+3. Run L0-L4 content checks only if PBAC allows the request.
+4. Forward upstream only if the content firewall allows the request.
+5. Execute real tools only through the `/agentgate/tools/execute` gateway, which performs a second exact-name PBAC check before any tool adapter is allowed to run.
+
+Accepted policies live in `pbac_policy_documents`. PBAC decisions live in `pbac_decision_logs`.
+
+Tool gateway calls use:
+
+```http
+POST /agentgate/tools/execute
+```
+
+with a body such as:
+
+```json
+{
+  "agent_id": "star",
+  "tool_name": "send_email",
+  "arguments": {
+    "subject": "Lease summary",
+    "body": "..."
+  },
+  "user_request": "Read this lease and email the result to me."
+}
+```
+
+In local mock mode, the gateway returns a mock tool result after PBAC allows the exact tool name. In remote mode, PBAC still authorizes or blocks the call, but a real tool executor adapter must be wired behind this endpoint.
 
 ## Configure Protected Workflows
 

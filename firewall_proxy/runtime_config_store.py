@@ -222,7 +222,7 @@ def parse_tool_registry(raw_value: str) -> list[ToolRegistryEntry]:
     seen: set[str] = set()
     for line in _split_tool_lines(raw_value):
         parts = [part.strip() for part in line.split("|")]
-        name = parts[0].strip()
+        name = _clean_tool_name(parts[0])
         if not name or name in seen:
             continue
         category = parts[1].strip() if len(parts) > 1 and parts[1].strip() else _infer_tool_category(name)
@@ -316,9 +316,15 @@ def _normalize_tool_registry(raw_entries: list[ToolRegistryEntry | dict[str, Any
     seen: set[str] = set()
     for raw_entry in raw_entries:
         if isinstance(raw_entry, ToolRegistryEntry):
-            entry = raw_entry
+            entry = ToolRegistryEntry(
+                name=_clean_tool_name(raw_entry.name),
+                category=raw_entry.category,
+                purpose=raw_entry.purpose,
+                risk=raw_entry.risk,
+                enabled=raw_entry.enabled,
+            )
         elif isinstance(raw_entry, dict):
-            name = str(raw_entry.get("name") or "").strip()
+            name = _clean_tool_name(str(raw_entry.get("name") or ""))
             if not name:
                 continue
             category = str(raw_entry.get("category") or _infer_tool_category(name)).strip()
@@ -352,6 +358,14 @@ def _split_tool_lines(raw_value: str) -> list[str]:
             continue
         lines.extend(part.strip() for part in line.split(",") if part.strip())
     return lines
+
+
+def _clean_tool_name(name: str) -> str:
+    cleaned = str(name).strip().strip("`").strip()
+    for _ in range(2):
+        if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {"'", '"'}:
+            cleaned = cleaned[1:-1].strip()
+    return cleaned
 
 
 def _infer_tool_category(name: str) -> str:

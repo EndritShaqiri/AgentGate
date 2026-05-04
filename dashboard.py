@@ -12,6 +12,17 @@ import pandas as pd
 import streamlit as st
 
 from firewall_proxy.config import load_config
+from firewall_proxy.policy import (
+    compile_policy_document,
+    compute_policy_source_hash,
+    ensure_policy_tables,
+    format_policy_json,
+    load_active_policy_document,
+    load_latest_policy_document,
+    load_recent_pbac_decisions,
+    save_active_policy_document,
+    validate_policy_document,
+)
 from firewall_proxy.runtime_config_store import (
     clear_runtime_agent_setup,
     format_tool_registry,
@@ -742,17 +753,177 @@ def render_runtime_agent_setup_editor() -> None:
             st.error(str(exc))
         else:
             mode = "local mock" if saved.use_local_mock else "remote upstream"
+            draft_policy = compile_policy_document(saved)
+            st.session_state["pbac_policy_draft"] = format_policy_json(draft_policy)
+            st.session_state["pbac_policy_draft_hash"] = draft_policy["source_hash"]
+            st.session_state["pbac_policy_editing"] = False
+            st.session_state["pbac_policy_collapsed"] = False
+            st.session_state.pop("pbac_policy_editor_text", None)
             st.success(
-                f"Saved `{saved.agent_id}` with {mode}. The firewall will use it on the next request."
+                f"Saved `{saved.agent_id}` with {mode}. Review and accept the generated PBAC policy below before protected requests continue."
             )
-            st.rerun()
 
     if clear_clicked:
         clear_runtime_agent_setup(DB_PATH)
+        for key in ("pbac_policy_draft", "pbac_policy_draft_hash", "pbac_policy_editing", "pbac_policy_collapsed"):
+            st.session_state.pop(key, None)
         st.warning("Cleared the runtime setup. Protected requests will pause until you save a new one.")
         st.rerun()
 
     st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_pbac_policy_review() -> None:
+    ensure_policy_tables(DB_PATH)
+    setup = load_runtime_agent_setup(DB_PATH)
+
+    st.markdown('<div class="panel-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">PBAC Policy Review</div>', unsafe_allow_html=True)
+
+    if setup is None:
+        st.info("Save a runtime agent setup to generate a PBAC policy draft.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    source_hash = compute_policy_source_hash(setup)
+    active_policy = load_active_policy_document(DB_PATH, setup.agent_id, source_hash)
+    latest_policy = load_latest_policy_document(DB_PATH, setup.agent_id)
+
+    status_col, action_col = st.columns([0.62, 0.38])
+    with status_col:
+        if active_policy is not None:
+            policy_id, _policy = active_policy
+            st.success(f"Accepted PBAC policy #{policy_id} is active for `{setup.agent_id}`.")
+            st.caption("Runtime PBAC uses this policy as a binary structural gate before L0-L4 scoring.")
+        elif latest_policy and latest_policy.get("source_hash") != source_hash:
+            st.warning("The saved setup changed after the last accepted policy. Generate and accept a fresh policy.")
+        else:
+            st.warning("No accepted PBAC policy is active for the current setup. Protected requests with registered tools are denied until acceptance.")
+
+        st.markdown(
+            '<div class="summary-grid">'
+            + summary_item("Agent", setup.agent_id)
+            + summary_item("Source Hash", source_hash[:16])
+            + summary_item("Registered Tools", len(setup.tool_registry))
+            + summary_item("Active Policy", f"#{active_policy[0]}" if active_policy else "Not accepted")
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+    with action_col:
+        if st.button("Generate Policy Draft", type="primary", use_container_width=True):
+            draft_policy = compile_policy_document(setup)
+            st.session_state["pbac_policy_draft"] = format_policy_json(draft_policy)
+            st.session_state["pbac_policy_draft_hash"] = draft_policy["source_hash"]
+            st.session_state["pbac_policy_editing"] = False
+            st.session_state["pbac_policy_collapsed"] = False
+            st.session_state.pop("pbac_policy_editor_text", None)
+            st.rerun()
+        if active_policy is not None and st.button("Load Active Policy", use_container_width=True):
+            st.session_state["pbac_policy_draft"] = format_policy_json(active_policy[1])
+            st.session_state["pbac_policy_draft_hash"] = source_hash
+            st.session_state["pbac_policy_editing"] = False
+            st.session_state["pbac_policy_collapsed"] = False
+            st.session_state.pop("pbac_policy_editor_text", None)
+            st.rerun()
+
+    draft_text = st.session_state.get("pbac_policy_draft")
+    draft_hash = st.session_state.get("pbac_policy_draft_hash")
+    if not draft_text or draft_hash != source_hash:
+        if active_policy is not None:
+            draft_text = format_policy_json(active_policy[1])
+            st.session_state["pbac_policy_collapsed"] = True
+        else:
+            draft_policy = compile_policy_document(setup)
+            draft_text = format_policy_json(draft_policy)
+            st.session_state["pbac_policy_collapsed"] = False
+        st.session_state["pbac_policy_draft"] = draft_text
+        st.session_state["pbac_policy_draft_hash"] = source_hash
+        st.session_state["pbac_policy_editing"] = False
+        st.session_state.pop("pbac_policy_editor_text", None)
+
+    editing = bool(st.session_state.get("pbac_policy_editing", False))
+    st.caption(
+        "Review the generated policy. `ACCEPT` persists it as the active PBAC policy; `EDIT` lets you adjust the JSON before saving."
+    )
+
+    policy_expanded = editing or not bool(st.session_state.get("pbac_policy_collapsed", False))
+    with st.expander("Policy JSON", expanded=policy_expanded):
+        if editing:
+            edited_text = st.text_area(
+                "PBAC policy JSON",
+                value=str(draft_text),
+                height=460,
+                key="pbac_policy_editor_text",
+            )
+            button_col_1, button_col_2 = st.columns([0.22, 0.78])
+            with button_col_1:
+                accept_clicked = st.button("ACCEPT", type="primary", use_container_width=True, key="accept_edited_pbac")
+            with button_col_2:
+                if st.button("Cancel Edit", use_container_width=True):
+                    st.session_state["pbac_policy_editing"] = False
+                    st.session_state["pbac_policy_collapsed"] = False
+                    st.session_state.pop("pbac_policy_editor_text", None)
+                    st.rerun()
+
+            if accept_clicked:
+                _accept_policy_text(edited_text, setup)
+        else:
+            try:
+                st.json(json.loads(str(draft_text)))
+            except json.JSONDecodeError:
+                st.code(str(draft_text), language="json")
+
+            button_col_1, button_col_2, button_col_3 = st.columns([0.18, 0.18, 0.64])
+            with button_col_1:
+                if st.button("ACCEPT", type="primary", use_container_width=True, key="accept_generated_pbac"):
+                    _accept_policy_text(str(draft_text), setup)
+            with button_col_2:
+                if st.button("EDIT", use_container_width=True, key="edit_generated_pbac"):
+                    st.session_state["pbac_policy_editing"] = True
+                    st.session_state["pbac_policy_collapsed"] = False
+                    st.rerun()
+            with button_col_3:
+                st.caption("PBAC policies are stored separately from firewall scores and never feed risk fusion.")
+
+    recent_pbac = load_recent_pbac_decisions(DB_PATH, max_rows=8)
+    if recent_pbac:
+        with st.expander("Recent PBAC Decisions", expanded=False):
+            st.dataframe(pd.DataFrame(recent_pbac), use_container_width=True, hide_index=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _accept_policy_text(raw_text: str, setup: Any) -> None:
+    try:
+        policy = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        st.error(f"Policy JSON is invalid: {exc}")
+        return
+    if not isinstance(policy, dict):
+        st.error("Policy must be a JSON object.")
+        return
+
+    validation_errors = validate_policy_document(policy, setup)
+    if validation_errors:
+        st.error("Policy validation failed.")
+        for error in validation_errors:
+            st.write(f"- {error}")
+        return
+
+    try:
+        policy_id = save_active_policy_document(DB_PATH, policy, setup)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+
+    st.session_state["pbac_policy_draft"] = format_policy_json(policy)
+    st.session_state["pbac_policy_draft_hash"] = compute_policy_source_hash(setup)
+    st.session_state["pbac_policy_editing"] = False
+    st.session_state["pbac_policy_collapsed"] = True
+    st.session_state.pop("pbac_policy_editor_text", None)
+    st.success(f"Accepted PBAC policy #{policy_id}. Protected requests can continue through the PBAC plane.")
+    st.rerun()
 
 
 st.set_page_config(page_title="AI Firewall Dashboard", layout="wide")
@@ -828,6 +999,7 @@ st.markdown(
 )
 
 render_runtime_agent_setup_editor()
+render_pbac_policy_review()
 
 logs = load_logs()
 if logs.empty:

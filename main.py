@@ -26,6 +26,11 @@ from firewall_proxy.firewall import (
     normalize_user_message,
 )
 from firewall_proxy.log_store import AsyncSQLiteLogger, FirewallLogRecord
+from firewall_proxy.policy import (
+    PBACDecision,
+    evaluate_pbac_request,
+    record_pbac_decision,
+)
 from firewall_proxy.runtime_config_store import clear_runtime_agent_setup, load_runtime_agent_setup
 from firewall_proxy.runtime_state import is_global_firewall_enabled
 
@@ -225,6 +230,108 @@ def build_generic_block_response(
     }
 
 
+def build_pbac_details(decision: PBACDecision) -> dict[str, Any]:
+    return {
+        "id": f"pbac-{uuid.uuid4().hex}",
+        "object": "pbac.decision",
+        "created": int(time.time()),
+        "agent_id": decision.agent_id,
+        "decision": decision.decision,
+        "forwarded": False,
+        "trigger": decision.trigger,
+        "message": decision.reason,
+        "policy_id": decision.policy_id,
+        "policy_hash": decision.policy_hash,
+        "requested_tools": [tool.to_dict() for tool in decision.requested_tools],
+        "allowed_tools": decision.allowed_tools,
+        "denied_tools": decision.denied_tools,
+        "required_tools": decision.required_tools,
+        "details": {
+            **decision.details,
+            "plane": "PBAC",
+            "decision_type": "binary",
+            "content_scores_used": False,
+        },
+    }
+
+
+def build_pbac_block_message(decision: PBACDecision) -> str:
+    return f"Request blocked by PBAC policy: {decision.reason}"
+
+
+def build_pbac_chat_block_response(decision: PBACDecision, request_body: Any) -> dict[str, Any]:
+    content = build_pbac_block_message(decision)
+    completion_tokens = len(content.split())
+    model_name = request_body.get("model") if isinstance(request_body, dict) else None
+    return {
+        "id": f"chatcmpl-pbac-{uuid.uuid4().hex[:12]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model_name or app.state.config.upstream.default_model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": completion_tokens,
+            "total_tokens": completion_tokens,
+        },
+        "pbac": build_pbac_details(decision),
+    }
+
+
+def build_pbac_responses_block_response(decision: PBACDecision, request_body: Any) -> dict[str, Any]:
+    content = build_pbac_block_message(decision)
+    output_tokens = len(content.split())
+    model_name = request_body.get("model") if isinstance(request_body, dict) else None
+    return {
+        "id": f"resp-pbac-{uuid.uuid4().hex[:12]}",
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": model_name or app.state.config.upstream.default_model,
+        "output": [
+            {
+                "id": f"msg-pbac-{uuid.uuid4().hex[:12]}",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": content,
+                        "annotations": [],
+                    }
+                ],
+            }
+        ],
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": output_tokens,
+            "total_tokens": output_tokens,
+        },
+        "pbac": build_pbac_details(decision),
+    }
+
+
+def build_pbac_generic_block_response(decision: PBACDecision, request_body: Any) -> dict[str, Any]:
+    return {
+        "id": f"pbac-block-{uuid.uuid4().hex[:12]}",
+        "object": "pbac.block",
+        "status": "blocked",
+        "message": build_pbac_block_message(decision),
+        "request": request_body if isinstance(request_body, dict) else {"raw_body": str(request_body)[:2000]},
+        "pbac": build_pbac_details(decision),
+    }
+
+
 def resolve_agent_id(body: Any, request: Request, config: AppConfig) -> str:
     metadata = body.get("metadata") if isinstance(body, dict) and isinstance(body.get("metadata"), dict) else {}
     requested_agent = (
@@ -293,10 +400,13 @@ def forwardable_headers(request: Request) -> dict[str, str]:
 async def forward_upstream(
     request: Request,
     config: AppConfig,
+    extra_headers: dict[str, str] | None = None,
 ) -> tuple[int, dict[str, str], bytes]:
     upstream_url = build_upstream_url(request, config)
     request_body = await request.body()
     request_headers = forwardable_headers(request)
+    if extra_headers:
+        request_headers.update(extra_headers)
 
     async with httpx.AsyncClient(timeout=config.upstream.timeout_seconds) as client:
         upstream_response = await client.request(
@@ -400,6 +510,28 @@ def build_firewall_sdk_response(
     return build_generic_block_response(decision, request_body)
 
 
+def build_pbac_sdk_response(
+    route_config: ProtectedRouteConfig,
+    request_body: Any,
+    decision: PBACDecision,
+) -> dict[str, Any]:
+    response_format = route_config.block_response_format.lower()
+
+    if response_format == "openai_response":
+        return build_pbac_responses_block_response(decision, request_body)
+
+    if response_format == "openai_chat":
+        return build_pbac_chat_block_response(decision, request_body)
+
+    if response_format == "auto" and isinstance(request_body, dict):
+        if "input" in request_body and "messages" not in request_body:
+            return build_pbac_responses_block_response(decision, request_body)
+        if "messages" in request_body:
+            return build_pbac_chat_block_response(decision, request_body)
+
+    return build_pbac_generic_block_response(decision, request_body)
+
+
 def parse_request_body(request: Request, body_bytes: bytes) -> Any:
     content_type = request.headers.get("content-type", "").lower()
     if not body_bytes:
@@ -425,6 +557,66 @@ def request_payload_for_logs(parsed_body: Any) -> Any:
     if isinstance(parsed_body, dict):
         return parsed_body
     return {"raw_body": str(parsed_body)}
+
+
+def extract_tool_gateway_request(body: Any) -> tuple[str, Any]:
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Tool gateway body must be a JSON object.")
+
+    tool_name = (
+        body.get("tool_name")
+        or body.get("name")
+        or body.get("function_name")
+        or (
+            body.get("tool", {}).get("name")
+            if isinstance(body.get("tool"), dict)
+            else None
+        )
+    )
+    if not isinstance(tool_name, str) or not tool_name.strip():
+        raise HTTPException(status_code=400, detail="Tool gateway requires `tool_name`.")
+
+    arguments = body.get("arguments")
+    if arguments is None:
+        arguments = body.get("args", {})
+
+    return tool_name.strip(), arguments
+
+
+def build_mock_tool_result(tool_name: str, arguments: Any) -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "mock": True,
+        "tool_name": tool_name,
+        "arguments": arguments if isinstance(arguments, dict) else {"value": arguments},
+        "message": "PBAC allowed this tool call. Local mock mode returned a mock tool result.",
+    }
+
+
+def build_tool_gateway_response(
+    *,
+    tool_name: str,
+    arguments: Any,
+    decision: PBACDecision,
+    config: AppConfig,
+) -> tuple[int, dict[str, Any]]:
+    if config.upstream.use_local_mock:
+        return 200, {
+            "status": "ok",
+            "tool_name": tool_name,
+            "result": build_mock_tool_result(tool_name, arguments),
+            "pbac": build_pbac_details(decision),
+        }
+
+    return 501, {
+        "status": "authorized_but_not_executed",
+        "tool_name": tool_name,
+        "message": (
+            "PBAC allowed this tool call, but no real tool executor is configured inside AgentGate. "
+            "Route your tool implementation through this endpoint or add an executor adapter here."
+        ),
+        "pbac": build_pbac_details(decision),
+    }
 
 
 def decision_payload_for_logs(decision: FirewallDecision) -> dict[str, Any]:
@@ -596,6 +788,51 @@ async def handle_protected_request(request: Request, route_config: ProtectedRout
     refresh_runtime_agent_setup(config)
     engine.scope_service.refresh_profiles_if_changed()
     agent_id = resolve_agent_id(body, request, config)
+    runtime_setup = load_runtime_agent_setup(config.database.path)
+    try:
+        pbac_user_text = normalize_user_message(
+            extract_user_text_from_sources(
+                body=body,
+                query_params=dict(request.query_params),
+                headers=dict(request.headers),
+                content_sources=route_config.content_sources,
+            )
+        )
+    except ValueError:
+        pbac_user_text = ""
+    pbac_decision = evaluate_pbac_request(
+        db_path=config.database.path,
+        setup=runtime_setup,
+        agent_id=agent_id,
+        body=body,
+        user_text=pbac_user_text,
+        headers=dict(request.headers),
+    )
+
+    if pbac_decision.decision == "DENY":
+        pbac_response = build_pbac_sdk_response(route_config, body, pbac_decision)
+        record_pbac_decision(
+            config.database.path,
+            pbac_decision,
+            request_payload=sanitize_payload_for_logs(request_payload_for_logs(body)),
+            response_payload=pbac_response,
+        )
+        log_event(
+            "pbac.blocked",
+            agent_id=agent_id,
+            route_name=route_config.name,
+            path=request.url.path,
+            trigger=pbac_decision.trigger,
+            denied_tools=pbac_decision.denied_tools,
+        )
+        response = JSONResponse(status_code=route_config.block_status_code, content=pbac_response)
+        response.headers["x-pbac-decision"] = pbac_decision.decision
+        response.headers["x-pbac-trigger"] = pbac_decision.trigger
+        response.headers["x-firewall-decision"] = "NOT_EVALUATED"
+        response.headers["x-firewall-forwarded"] = "false"
+        response.headers["x-firewall-bypassed"] = "false"
+        return response
+
     should_protect, toggle_reason = should_apply_firewall(body=body, request=request, config=config)
 
     if not should_protect:
@@ -637,6 +874,12 @@ async def handle_protected_request(request: Request, route_config: ProtectedRout
                 decision_reasons=[toggle_reason],
             )
         )
+        record_pbac_decision(
+            config.database.path,
+            pbac_decision,
+            request_payload=sanitize_payload_for_logs(request_payload_for_logs(body)),
+            response_payload=upstream_payload,
+        )
         log_event(
             "firewall.bypass",
             agent_id=agent_id,
@@ -652,6 +895,8 @@ async def handle_protected_request(request: Request, route_config: ProtectedRout
             forwarded=True,
         )
         response.headers["x-firewall-bypassed"] = "true"
+        response.headers["x-pbac-decision"] = pbac_decision.decision
+        response.headers["x-pbac-trigger"] = pbac_decision.trigger
         return response
 
     try:
@@ -680,8 +925,17 @@ async def handle_protected_request(request: Request, route_config: ProtectedRout
                     detail=f"Failed to reach upstream endpoint: {upstream_exc}",
                 ) from upstream_exc
 
+            upstream_payload = parse_response_payload(response_headers, upstream_body)
+            record_pbac_decision(
+                config.database.path,
+                pbac_decision,
+                request_payload=sanitize_payload_for_logs(request_payload_for_logs(body)),
+                response_payload=upstream_payload,
+            )
             response = build_proxy_response(status_code, response_headers, upstream_body)
             response.headers["x-firewall-bypassed"] = "false"
+            response.headers["x-pbac-decision"] = pbac_decision.decision
+            response.headers["x-pbac-trigger"] = pbac_decision.trigger
             return response
 
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -711,6 +965,12 @@ async def handle_protected_request(request: Request, route_config: ProtectedRout
                 response_payload=upstream_payload,
             )
         )
+        record_pbac_decision(
+            config.database.path,
+            pbac_decision,
+            request_payload=sanitize_payload_for_logs(request_payload_for_logs(body), decision),
+            response_payload=upstream_payload,
+        )
         log_event(
             "firewall.allow",
             agent_id=agent_id,
@@ -728,6 +988,8 @@ async def handle_protected_request(request: Request, route_config: ProtectedRout
             forwarded=True,
         )
         response.headers["x-firewall-bypassed"] = "false"
+        response.headers["x-pbac-decision"] = pbac_decision.decision
+        response.headers["x-pbac-trigger"] = pbac_decision.trigger
         return response
 
     firewall_response = build_firewall_sdk_response(route_config, body, decision)
@@ -737,6 +999,12 @@ async def handle_protected_request(request: Request, route_config: ProtectedRout
             request_body=body,
             response_payload=firewall_response,
         )
+    )
+    record_pbac_decision(
+        config.database.path,
+        pbac_decision,
+        request_payload=sanitize_payload_for_logs(request_payload_for_logs(body), decision),
+        response_payload=firewall_response,
     )
     log_event(
         "firewall.blocked",
@@ -753,6 +1021,72 @@ async def handle_protected_request(request: Request, route_config: ProtectedRout
     response.headers["x-firewall-decision"] = decision.decision
     response.headers["x-firewall-forwarded"] = "false"
     response.headers["x-firewall-bypassed"] = "false"
+    response.headers["x-pbac-decision"] = pbac_decision.decision
+    response.headers["x-pbac-trigger"] = pbac_decision.trigger
+    return response
+
+
+@app.post("/agentgate/tools/execute", name="agentgate_tool_execute")
+async def agentgate_tool_execute(request: Request) -> Response:
+    body_bytes = await request.body()
+    body = parse_request_body(request, body_bytes)
+
+    config: AppConfig = app.state.config
+    refresh_runtime_agent_setup(config)
+    runtime_setup = load_runtime_agent_setup(config.database.path)
+    agent_id = resolve_agent_id(body, request, config)
+    tool_name, arguments = extract_tool_gateway_request(body)
+    tool_body = {
+        "tool_name": tool_name,
+        "arguments": arguments,
+    }
+    user_text = str(
+        body.get("user_request")
+        or body.get("intent")
+        or body.get("reason")
+        or tool_name
+    ) if isinstance(body, dict) else tool_name
+    pbac_decision = evaluate_pbac_request(
+        db_path=config.database.path,
+        setup=runtime_setup,
+        agent_id=agent_id,
+        body=tool_body,
+        user_text=user_text,
+        headers=dict(request.headers),
+    )
+
+    if pbac_decision.decision == "DENY":
+        response_payload = {
+            "status": "blocked",
+            "message": f"Tool blocked by PBAC policy: {pbac_decision.reason}",
+            "pbac": build_pbac_details(pbac_decision),
+        }
+        record_pbac_decision(
+            config.database.path,
+            pbac_decision,
+            request_payload=sanitize_payload_for_logs(request_payload_for_logs(body)),
+            response_payload=response_payload,
+        )
+        response = JSONResponse(status_code=403, content=response_payload)
+        response.headers["x-pbac-decision"] = pbac_decision.decision
+        response.headers["x-pbac-trigger"] = pbac_decision.trigger
+        return response
+
+    status_code, response_payload = build_tool_gateway_response(
+        tool_name=tool_name,
+        arguments=arguments,
+        decision=pbac_decision,
+        config=config,
+    )
+    record_pbac_decision(
+        config.database.path,
+        pbac_decision,
+        request_payload=sanitize_payload_for_logs(request_payload_for_logs(body)),
+        response_payload=response_payload,
+    )
+    response = JSONResponse(status_code=status_code, content=response_payload)
+    response.headers["x-pbac-decision"] = pbac_decision.decision
+    response.headers["x-pbac-trigger"] = pbac_decision.trigger
     return response
 
 
