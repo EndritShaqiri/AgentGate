@@ -77,7 +77,20 @@ The dashboard prompts for one runtime setup that contains both the protected age
 
 This single row is saved to SQLite and read by FastAPI before protected requests. The MiniLM semantic scope cache is rebuilt from that row, allowed requests are forwarded using the upstream settings in that same row, and exact tool names are preserved for future policy generation.
 
-After saving the runtime setup, the dashboard generates a reviewable PBAC policy draft from `description`, `allowed_examples`, `denied_examples`, and exact `tool_registry`. The policy is inactive until `ACCEPT`; `EDIT` allows JSON edits before activation. Accepted policies are stored separately in SQLite.
+After saving the runtime setup, the dashboard generates a reviewable PBAC policy draft from `description`, `allowed_examples`, `denied_examples`, and exact `tool_registry`. Policy drafting now uses an OpenAI-compatible LLM call by default, then AgentGate normalizes and validates the JSON locally before it can be accepted. Runtime PBAC enforcement remains deterministic: exact tool names are checked against the accepted policy, and no L0-L4 model scores are used by PBAC. The policy is inactive until `ACCEPT`; `EDIT` allows JSON edits before activation. Accepted policies are stored separately in SQLite.
+
+Configure the policy compiler in `config.yaml`:
+
+```yaml
+policy_generation:
+  mode: llm
+  api_base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  model: gpt-4o-mini
+  fallback_to_deterministic: true
+```
+
+Set the configured API key environment variable before opening the dashboard, for example `OPENAI_API_KEY`. If the LLM call fails and `fallback_to_deterministic` is true, the dashboard produces the previous local structured fallback draft and shows a warning. The fallback keeps demos usable, but accepted policy enforcement is the same exact-name PBAC gate either way.
 
 For tools, exact names are enough when the name describes the function:
 
@@ -106,7 +119,7 @@ PBAC is a separate structural plane from L0-L4. It never reads, writes, or fuses
 Protected request order:
 
 1. Match the protected route.
-2. Run PBAC against the active policy. PBAC checks declared tools and inferred intents: retrieval, document processing, external action, and code execution.
+2. Run PBAC against the active accepted policy. The policy may have been drafted by the configured LLM, but runtime PBAC is deterministic. It checks declared tools and inferred intents: retrieval, document processing, external action, and code execution.
 3. If PBAC allows, run L0-L4 content checks.
 4. If L0-L4 allows, forward upstream.
 5. Execute real tools only through `POST /agentgate/tools/execute`; the gateway performs a second exact-name PBAC check before an executor adapter can run.

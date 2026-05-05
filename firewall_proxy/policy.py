@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 from dataclasses import asdict, dataclass
@@ -9,11 +10,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
+
+from firewall_proxy.config import PolicyGenerationConfig
 from firewall_proxy.runtime_config_store import RuntimeAgentSetup, ToolRegistryEntry
 
 
 SCHEMA_VERSION = "agentgate.pbac.v1"
 COMPILER_VERSION = "local-structured-policy-compiler-v1"
+LLM_COMPILER_VERSION = "openai-compatible-policy-compiler-v1"
+POLICY_PROMPT_VERSION = "agentgate-pbac-policy-prompt-v1"
 
 GENERIC_TERMS = {
     "a",
@@ -183,6 +189,21 @@ class PBACDecision:
         }
 
 
+@dataclass(slots=True)
+class PolicyGenerationOutcome:
+    policy: dict[str, Any]
+    mode: str
+    used_llm: bool
+    fallback_used: bool
+    prompt: str
+    raw_response: str | None = None
+    error: str | None = None
+
+
+class PolicyGenerationError(RuntimeError):
+    pass
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -295,6 +316,357 @@ def compile_policy_document(setup: RuntimeAgentSetup) -> dict[str, Any]:
     }
 
 
+def generate_policy_document(
+    setup: RuntimeAgentSetup,
+    generation_config: PolicyGenerationConfig | None = None,
+) -> PolicyGenerationOutcome:
+    if generation_config is None or generation_config.mode != "llm":
+        policy = compile_policy_document(setup)
+        return PolicyGenerationOutcome(
+            policy=policy,
+            mode="local_structured_fallback",
+            used_llm=False,
+            fallback_used=False,
+            prompt=build_policy_generation_prompt(setup),
+        )
+
+    prompt = build_policy_generation_prompt(setup)
+    try:
+        policy, raw_response = generate_llm_policy_document(
+            setup=setup,
+            generation_config=generation_config,
+            prompt=prompt,
+        )
+    except Exception as exc:
+        if not generation_config.fallback_to_deterministic:
+            raise
+
+        policy = compile_policy_document(setup)
+        compiler = policy.get("compiler") if isinstance(policy.get("compiler"), dict) else {}
+        policy["compiler"] = {
+            **compiler,
+            "mode": "local_structured_fallback_after_llm_error",
+            "llm_prompt_version": POLICY_PROMPT_VERSION,
+            "llm_error": str(exc)[:1000],
+        }
+        return PolicyGenerationOutcome(
+            policy=policy,
+            mode="local_structured_fallback_after_llm_error",
+            used_llm=False,
+            fallback_used=True,
+            prompt=prompt,
+            error=str(exc),
+        )
+
+    return PolicyGenerationOutcome(
+        policy=policy,
+        mode="llm_generated",
+        used_llm=True,
+        fallback_used=False,
+        prompt=prompt,
+        raw_response=raw_response,
+    )
+
+
+def generate_llm_policy_document(
+    *,
+    setup: RuntimeAgentSetup,
+    generation_config: PolicyGenerationConfig,
+    prompt: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    prompt = prompt or build_policy_generation_prompt(setup)
+    if not generation_config.api_base_url:
+        raise PolicyGenerationError("PBAC policy LLM api_base_url is not configured.")
+    if not generation_config.model:
+        raise PolicyGenerationError("PBAC policy LLM model is not configured.")
+
+    api_key = os.getenv(generation_config.api_key_env) if generation_config.api_key_env else None
+    if not api_key and "api.openai.com" in generation_config.api_base_url:
+        raise PolicyGenerationError(
+            f"Environment variable {generation_config.api_key_env or 'OPENAI_API_KEY'} is required for OpenAI PBAC policy generation."
+        )
+
+    url = f"{generation_config.api_base_url.rstrip('/')}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    payload: dict[str, Any] = {
+        "model": generation_config.model,
+        "messages": [
+            {"role": "system", "content": _policy_generation_system_prompt()},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": generation_config.temperature,
+        "max_tokens": generation_config.max_tokens,
+    }
+    if generation_config.json_response_format:
+        payload["response_format"] = {"type": "json_object"}
+
+    try:
+        with httpx.Client(timeout=generation_config.timeout_seconds) as client:
+            response = client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            response_payload = response.json()
+    except Exception as exc:
+        raise PolicyGenerationError(f"PBAC policy LLM request failed: {exc}") from exc
+
+    raw_response = _extract_chat_completion_content(response_payload)
+    parsed = _parse_llm_policy_json(raw_response)
+    normalized = _normalize_llm_policy_document(
+        parsed,
+        setup=setup,
+        model_name=generation_config.model,
+    )
+    validation_errors = validate_policy_document(normalized, setup)
+    if validation_errors:
+        raise PolicyGenerationError(
+            "LLM-generated PBAC policy failed deterministic validation: " + " ".join(validation_errors)
+        )
+
+    return normalized, raw_response
+
+
+def build_policy_generation_prompt(setup: RuntimeAgentSetup) -> str:
+    source_hash = compute_policy_source_hash(setup)
+    setup_payload = {
+        "agent_id": setup.agent_id,
+        "description": setup.description,
+        "allowed_examples": setup.allowed_examples,
+        "denied_examples": setup.denied_examples,
+        "tool_registry": [tool.to_dict() for tool in setup.tool_registry],
+        "source_hash": source_hash,
+    }
+    schema_payload = {
+        "schema_version": SCHEMA_VERSION,
+        "agent_id": setup.agent_id,
+        "source_hash": source_hash,
+        "generated_at": "<ISO-8601 UTC timestamp>",
+        "default_effect": "deny",
+        "compiler": {
+            "type": "llm_policy_pipeline",
+            "mode": "llm_generated",
+            "version": LLM_COMPILER_VERSION,
+            "prompt_version": POLICY_PROMPT_VERSION,
+        },
+        "source_summary": {
+            "description_chars": len(setup.description),
+            "allowed_example_count": len(setup.allowed_examples),
+            "denied_example_count": len(setup.denied_examples),
+            "registered_tool_count": len(setup.tool_registry),
+            "domain_terms": ["<terms inferred from the allowed scope>"],
+        },
+        "default_tool_policy": {
+            "effect": "deny",
+            "reason": "Default deny all tools not explicitly allowed by an active intent rule.",
+        },
+        "intents": [
+            {
+                "name": "<domain>_<retrieval|document_processing|external_action|code_execution>",
+                "description": "<plain English intent>",
+                "allowed_tools": ["<exact registered tool names>"],
+                "conditions": ["<allowed condition names>"],
+            }
+        ],
+        "tool_rules": [
+            {
+                "tool": "<exact registered tool name or *>",
+                "effect": "allow|deny",
+                "intents": ["<intent names when allowed>"],
+                "conditions": ["<allowed condition names>"],
+                "reason": "<specific authorization rationale>",
+            }
+        ],
+        "denied_tools": [{"tool": "<exact registered tool name>", "reason": "<why denied>"}],
+        "runtime_enforcement": {
+            "plane": "PBAC",
+            "decision_type": "binary",
+            "content_scores_used": False,
+            "tool_gateway_required": True,
+            "policy_mode": "tool_gateway_only",
+        },
+    }
+    allowed_conditions = [
+        "request_intent_matches_allowed_scope",
+        "tool_name_in_registry",
+        "request_has_document_or_attachment",
+        "user_explicitly_requested_external_action",
+        "recipient_is_configured_or_approved",
+        "code_execution_explicitly_required",
+        "human_review_required",
+    ]
+    return (
+        "Generate a PBAC policy JSON document for AgentGate.\n\n"
+        "AgentGate architecture context:\n"
+        "- Protected request order is: protected route match -> PBAC structural gate -> L0-L4 content firewall -> "
+        "forward upstream unchanged if allowed -> actual tool execution through /agentgate/tools/execute.\n"
+        "- PBAC is the structural access-control plane. It runs before L0-L4 and must never depend on content scores.\n"
+        "- L0-L4 separately checks semantic scope, direct prompt injection, PII, text attachments, multimodal content, "
+        "and code/tool misuse. Do not put L0-L4 scores or thresholds into PBAC policy conditions.\n"
+        "- Runtime PBAC enforcement is deterministic and exact-name based: every requested or inferred tool must be "
+        "registered and explicitly allowed, otherwise the request is denied before L0-L4 runs.\n"
+        "- Tool execution receives a second PBAC check at /agentgate/tools/execute.\n\n"
+        "Runtime PBAC intent inference:\n"
+        "- retrieval: search, lookup, retrieve, research, cite, source, legal question answering.\n"
+        "- document_processing: summarize/read/review/extract/flag/compare an uploaded attachment, file, PDF, document, or lease.\n"
+        "- external_action: email, send, forward, notify, deliver, message a recipient.\n"
+        "- code_execution: execute/run code, Python, shell, bash, PowerShell, notebook, sandbox, terminal, eval/exec/subprocess.\n\n"
+        "Policy-generation rules:\n"
+        "1. Output exactly one JSON object and no markdown.\n"
+        "2. Use schema_version, agent_id, and source_hash exactly as provided.\n"
+        "3. default_effect must be deny, and tool_rules must include a wildcard '*' deny rule.\n"
+        "4. Include exactly one explicit allow or deny rule for every registered tool name. Use exact names only.\n"
+        "5. Allow a tool only when the description or allowed examples clearly require that category and the tool's name/purpose fits the domain.\n"
+        "6. Deny tools that are unrelated to the allowed domain, ambiguous, disabled, high risk without explicit permission, or only mentioned in denied examples.\n"
+        "7. Deny code_execution unless the allowed examples explicitly require code execution. Never treat a denied example mentioning code as permission.\n"
+        "8. External-action tools must require explicit user request and configured/approved/fixed-recipient constraints.\n"
+        "9. Keep runtime_enforcement.content_scores_used false. PBAC must not fuse with L0-L4 scores.\n"
+        "10. Write specific reasons suitable for security review.\n\n"
+        "Allowed condition names:\n"
+        f"{json.dumps(allowed_conditions, ensure_ascii=False)}\n\n"
+        "Required output shape:\n"
+        f"{json.dumps(schema_payload, ensure_ascii=False, indent=2)}\n\n"
+        "Runtime setup to compile:\n"
+        f"{json.dumps(setup_payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def _policy_generation_system_prompt() -> str:
+    return (
+        "You are the AgentGate PBAC policy compiler. Your job is to author least-privilege "
+        "tool access-control policy JSON for an AI firewall gateway. Be conservative: deny "
+        "anything not clearly authorized by the runtime setup. Runtime enforcement is exact-name, "
+        "deterministic, and separate from L0-L4 model risk scoring. Return valid JSON only."
+    )
+
+
+def _extract_chat_completion_content(response_payload: Any) -> str:
+    if not isinstance(response_payload, dict):
+        raise PolicyGenerationError("PBAC policy LLM returned a non-object response.")
+    choices = response_payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise PolicyGenerationError("PBAC policy LLM response did not include choices.")
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        raise PolicyGenerationError("PBAC policy LLM choice was not an object.")
+    message = first_choice.get("message")
+    if isinstance(message, dict) and isinstance(message.get("content"), str):
+        return message["content"]
+    if isinstance(first_choice.get("text"), str):
+        return first_choice["text"]
+    raise PolicyGenerationError("PBAC policy LLM response did not include text content.")
+
+
+def _parse_llm_policy_json(raw_response: str) -> dict[str, Any]:
+    text = raw_response.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise PolicyGenerationError("PBAC policy LLM response did not contain a JSON object.")
+        try:
+            parsed = json.loads(text[start : end + 1])
+        except json.JSONDecodeError as exc:
+            raise PolicyGenerationError(f"PBAC policy LLM response was not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise PolicyGenerationError("PBAC policy LLM response must be a JSON object.")
+    return parsed
+
+
+def _normalize_llm_policy_document(
+    policy: dict[str, Any],
+    *,
+    setup: RuntimeAgentSetup,
+    model_name: str,
+) -> dict[str, Any]:
+    normalized = dict(policy)
+    normalized["schema_version"] = SCHEMA_VERSION
+    normalized["agent_id"] = setup.agent_id
+    normalized["source_hash"] = compute_policy_source_hash(setup)
+    normalized["generated_at"] = utc_now()
+    normalized["default_effect"] = "deny"
+    normalized["compiler"] = {
+        "type": "llm_policy_pipeline",
+        "mode": "llm_generated",
+        "version": LLM_COMPILER_VERSION,
+        "model": model_name,
+        "prompt_version": POLICY_PROMPT_VERSION,
+        "note": (
+            "This policy was drafted by an OpenAI-compatible LLM call, then normalized and "
+            "validated locally. Runtime enforcement remains deterministic and exact-name based."
+        ),
+    }
+    normalized.setdefault(
+        "source_summary",
+        _source_summary_from_setup(setup),
+    )
+    normalized["default_tool_policy"] = {
+        "effect": "deny",
+        "reason": "Default deny all tools not explicitly allowed by an active intent rule.",
+    }
+    tool_rules = normalized.get("tool_rules")
+    if not isinstance(tool_rules, list):
+        tool_rules = []
+    if not any(isinstance(rule, dict) and str(rule.get("tool") or "").strip() == "*" for rule in tool_rules):
+        tool_rules.append(
+            {
+                "tool": "*",
+                "effect": "deny",
+                "intents": [],
+                "conditions": [],
+                "reason": "Default deny: tools are denied unless an explicit active policy rule allows the exact tool name.",
+            }
+        )
+    normalized["tool_rules"] = tool_rules
+    normalized["denied_tools"] = _denied_tools_from_rules(tool_rules)
+    normalized["runtime_enforcement"] = {
+        "plane": "PBAC",
+        "decision_type": "binary",
+        "content_scores_used": False,
+        "tool_gateway_required": True,
+        "policy_mode": "tool_gateway_only",
+    }
+    return normalized
+
+
+def _source_summary_from_setup(setup: RuntimeAgentSetup) -> dict[str, Any]:
+    positive_text = "\n".join([setup.description, *setup.allowed_examples])
+    source_tokens = _tokens(positive_text)
+    domain_terms = sorted(
+        token
+        for token in source_tokens
+        if token not in GENERIC_TERMS
+        and token not in RETRIEVAL_TERMS
+        and token not in DOCUMENT_TERMS
+        and token not in EXTERNAL_ACTION_TERMS
+        and token not in CODE_TERMS
+    )
+    return {
+        "description_chars": len(setup.description),
+        "allowed_example_count": len(setup.allowed_examples),
+        "denied_example_count": len(setup.denied_examples),
+        "registered_tool_count": len(setup.tool_registry),
+        "domain_terms": domain_terms[:12],
+    }
+
+
+def _denied_tools_from_rules(rules: list[Any]) -> list[dict[str, str]]:
+    denied: list[dict[str, str]] = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        tool_name = str(rule.get("tool") or "").strip()
+        effect = str(rule.get("effect") or "").strip().lower()
+        if tool_name and tool_name != "*" and effect == "deny":
+            denied.append({"tool": tool_name, "reason": str(rule.get("reason") or "Tool denied by policy.")})
+    return denied
+
+
 def validate_policy_document(policy: dict[str, Any], setup: RuntimeAgentSetup) -> list[str]:
     errors: list[str] = []
     if policy.get("schema_version") != SCHEMA_VERSION:
@@ -305,8 +677,21 @@ def validate_policy_document(policy: dict[str, Any], setup: RuntimeAgentSetup) -
         errors.append("source_hash does not match the active runtime setup.")
     if policy.get("default_effect") != "deny":
         errors.append("default_effect must be deny.")
+    runtime_enforcement = policy.get("runtime_enforcement")
+    if not isinstance(runtime_enforcement, dict):
+        errors.append("runtime_enforcement must be an object.")
+    else:
+        if runtime_enforcement.get("plane") != "PBAC":
+            errors.append("runtime_enforcement.plane must be PBAC.")
+        if runtime_enforcement.get("decision_type") != "binary":
+            errors.append("runtime_enforcement.decision_type must be binary.")
+        if runtime_enforcement.get("content_scores_used") is not False:
+            errors.append("runtime_enforcement.content_scores_used must be false.")
+        if runtime_enforcement.get("tool_gateway_required") is not True:
+            errors.append("runtime_enforcement.tool_gateway_required must be true.")
 
     registry_names = {tool.name for tool in setup.tool_registry}
+    registry_by_name = {tool.name: tool for tool in setup.tool_registry}
     rules = policy.get("tool_rules")
     if not isinstance(rules, list):
         errors.append("tool_rules must be a list.")
@@ -328,6 +713,14 @@ def validate_policy_document(policy: dict[str, Any], setup: RuntimeAgentSetup) -
             errors.append("Wildcard tool rule may only deny.")
         if tool_name != "*" and tool_name not in registry_names:
             errors.append(f"tool `{tool_name}` is not present in the runtime tool_registry.")
+        if tool_name in seen_tools:
+            errors.append(f"Duplicate tool rule for `{tool_name}` is not allowed.")
+        if tool_name != "*" and effect == "allow":
+            tool = registry_by_name.get(tool_name)
+            if tool and _is_high_risk_tool(tool) and not _policy_source_explicitly_allows_code_execution(setup):
+                errors.append(
+                    f"High-risk tool `{tool_name}` cannot be allowed unless allowed examples explicitly require code execution."
+                )
         seen_tools.add(tool_name)
 
     enabled_tools = {tool.name for tool in setup.tool_registry if tool.enabled}
@@ -338,6 +731,16 @@ def validate_policy_document(policy: dict[str, Any], setup: RuntimeAgentSetup) -
         errors.append("A wildcard default-deny tool rule is required.")
 
     return errors
+
+
+def _is_high_risk_tool(tool: ToolRegistryEntry) -> bool:
+    return tool.category.lower().strip() == "code_execution" or "high_risk" in tool.risk.lower()
+
+
+def _policy_source_explicitly_allows_code_execution(setup: RuntimeAgentSetup) -> bool:
+    positive_tokens = _tokens("\n".join([setup.description, *setup.allowed_examples]))
+    denied_tokens = _tokens("\n".join(setup.denied_examples))
+    return bool(positive_tokens & CODE_TERMS) and not bool(denied_tokens & CODE_TERMS)
 
 
 def format_policy_json(policy: dict[str, Any]) -> str:

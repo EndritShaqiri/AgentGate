@@ -44,6 +44,19 @@ upstream:
   timeout_seconds: 20
   default_model: mock-guarded-model
 
+policy_generation:
+  # PBAC policy drafts are generated at authoring time with an OpenAI-compatible
+  # chat model, then validated and enforced deterministically at runtime.
+  mode: llm
+  api_base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  model: gpt-4o-mini
+  timeout_seconds: 30
+  temperature: 0.1
+  max_tokens: 2600
+  json_response_format: true
+  fallback_to_deterministic: true
+
 firewall:
   # Global fallbacks for routes that do not override content_sources or block status.
   default_content_sources:

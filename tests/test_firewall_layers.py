@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import asyncio
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ from firewall_proxy.config import (
     FirewallProxyConfig,
     LoggingConfig,
     ModelConfig,
+    PolicyGenerationConfig,
     ProtectedRouteConfig,
     ThresholdConfig,
     UpstreamConfig,
@@ -36,6 +38,7 @@ from firewall_proxy.policy import (
     compute_policy_source_hash,
     evaluate_pbac_request,
     extract_tool_references,
+    generate_policy_document,
     load_active_policy_document,
     save_active_policy_document,
 )
@@ -107,6 +110,17 @@ def make_config() -> AppConfig:
             base_url=None,
             timeout_seconds=1.0,
             default_model="mock-model",
+        ),
+        policy_generation=PolicyGenerationConfig(
+            mode="deterministic",
+            api_base_url="https://api.openai.com/v1",
+            api_key_env="OPENAI_API_KEY",
+            model="gpt-4o-mini",
+            timeout_seconds=1.0,
+            temperature=0.1,
+            max_tokens=1200,
+            json_response_format=True,
+            fallback_to_deterministic=True,
         ),
         firewall=FirewallProxyConfig(
             protected_routes=[route],
@@ -519,6 +533,149 @@ def test_pbac_compiler_denies_tools_unrelated_to_policy_domain() -> None:
     assert effects["summarize_footballmateches_pdf"] == "deny"
     assert effects["send_to_ronaldo_email"] == "deny"
     assert effects["code_execution"] == "deny"
+
+
+def test_pbac_llm_generator_uses_agentgate_prompt_and_validates(monkeypatch) -> None:
+    setup = RuntimeAgentSetup(
+        agent_id="housing",
+        description="A Massachusetts housing-law assistant that searches legal sources.",
+        allowed_examples=["Search Massachusetts law and cite the source."],
+        denied_examples=["Run arbitrary code."],
+        tool_registry=parse_tool_registry(
+            """
+            search_massachusetts_law
+            code_execution
+            """
+        ),
+        use_local_mock=True,
+        base_url=None,
+        timeout_seconds=5.0,
+        default_model="mock-model",
+        updated_at=datetime.now(timezone.utc).isoformat(),
+    )
+    posted: dict[str, object] = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            policy = {
+                "schema_version": "agentgate.pbac.v1",
+                "agent_id": "housing",
+                "source_hash": compute_policy_source_hash(setup),
+                "default_effect": "deny",
+                "intents": [
+                    {
+                        "name": "massachusetts_housing_retrieval",
+                        "description": "Search Massachusetts housing-law sources.",
+                        "allowed_tools": ["search_massachusetts_law"],
+                        "conditions": ["request_intent_matches_allowed_scope", "tool_name_in_registry"],
+                    }
+                ],
+                "tool_rules": [
+                    {
+                        "tool": "search_massachusetts_law",
+                        "effect": "allow",
+                        "intents": ["massachusetts_housing_retrieval"],
+                        "conditions": ["request_intent_matches_allowed_scope", "tool_name_in_registry"],
+                        "reason": "The allowed examples require Massachusetts legal-source retrieval.",
+                    },
+                    {
+                        "tool": "code_execution",
+                        "effect": "deny",
+                        "intents": [],
+                        "conditions": [],
+                        "reason": "Code execution is not required by the allowed examples and is denied.",
+                    },
+                ],
+            }
+            return {"choices": [{"message": {"content": json.dumps(policy)}}]}
+
+    class FakeClient:
+        def __init__(self, timeout: float) -> None:
+            self.timeout = timeout
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, headers: dict, json: dict) -> FakeResponse:
+            posted["url"] = url
+            posted["headers"] = headers
+            posted["payload"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr("firewall_proxy.policy.httpx.Client", FakeClient)
+    outcome = generate_policy_document(
+        setup,
+        PolicyGenerationConfig(
+            mode="llm",
+            api_base_url="http://policy-llm.local/v1",
+            api_key_env="",
+            model="policy-model",
+            timeout_seconds=3.0,
+            temperature=0.1,
+            max_tokens=1600,
+            json_response_format=True,
+            fallback_to_deterministic=False,
+        ),
+    )
+
+    assert outcome.used_llm is True
+    assert outcome.policy["compiler"]["mode"] == "llm_generated"
+    assert outcome.policy["runtime_enforcement"]["content_scores_used"] is False
+    assert {rule["tool"]: rule["effect"] for rule in outcome.policy["tool_rules"]}["code_execution"] == "deny"
+    assert posted["url"] == "http://policy-llm.local/v1/chat/completions"
+    payload = posted["payload"]
+    assert isinstance(payload, dict)
+    rendered_messages = json.dumps(payload["messages"])
+    assert "protected route match -> PBAC structural gate -> L0-L4 content firewall" in rendered_messages
+    assert "/agentgate/tools/execute" in rendered_messages
+
+
+def test_pbac_llm_generation_falls_back_when_openai_key_missing(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    setup = RuntimeAgentSetup(
+        agent_id="housing",
+        description="A housing assistant that can summarize uploaded PDFs.",
+        allowed_examples=["Summarize this lease PDF."],
+        denied_examples=["Run arbitrary code."],
+        tool_registry=parse_tool_registry(
+            """
+            summarize_uploaded_pdf
+            code_execution
+            """
+        ),
+        use_local_mock=True,
+        base_url=None,
+        timeout_seconds=5.0,
+        default_model="mock-model",
+        updated_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    outcome = generate_policy_document(
+        setup,
+        PolicyGenerationConfig(
+            mode="llm",
+            api_base_url="https://api.openai.com/v1",
+            api_key_env="OPENAI_API_KEY",
+            model="gpt-4o-mini",
+            timeout_seconds=1.0,
+            temperature=0.1,
+            max_tokens=1600,
+            json_response_format=True,
+            fallback_to_deterministic=True,
+        ),
+    )
+
+    assert outcome.fallback_used is True
+    assert outcome.used_llm is False
+    assert "OPENAI_API_KEY" in str(outcome.error)
+    assert outcome.policy["compiler"]["mode"] == "local_structured_fallback_after_llm_error"
+    assert "PBAC structural gate" in outcome.prompt
 
 
 def test_pbac_policy_storage_and_request_gate(tmp_path: Path) -> None:

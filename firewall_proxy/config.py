@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +72,19 @@ class UpstreamConfig:
 
 
 @dataclass(slots=True)
+class PolicyGenerationConfig:
+    mode: str
+    api_base_url: str
+    api_key_env: str
+    model: str
+    timeout_seconds: float
+    temperature: float
+    max_tokens: int
+    json_response_format: bool
+    fallback_to_deterministic: bool
+
+
+@dataclass(slots=True)
 class ProtectedRouteConfig:
     name: str
     path_pattern: str
@@ -105,6 +119,7 @@ class AppConfig:
     thresholds: ThresholdConfig
     database: DatabaseConfig
     upstream: UpstreamConfig
+    policy_generation: PolicyGenerationConfig
     firewall: FirewallProxyConfig
     logging: LoggingConfig
     agents: dict[str, AgentConfig]
@@ -176,6 +191,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     }
 
     firewall_values = raw.get("firewall", {})
+    policy_generation_values = raw.get("policy_generation", {})
     route_values = firewall_values.get("protected_routes") or _default_protected_routes()
     protected_routes = [
         ProtectedRouteConfig(
@@ -247,6 +263,25 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             base_url=raw["upstream"].get("base_url") or raw["upstream"].get("url"),
             timeout_seconds=float(raw["upstream"]["timeout_seconds"]),
             default_model=raw["upstream"]["default_model"],
+        ),
+        policy_generation=PolicyGenerationConfig(
+            mode=str(policy_generation_values.get("mode", "llm")).strip().lower(),
+            api_base_url=str(
+                policy_generation_values.get("api_base_url")
+                or os.getenv("AGENTGATE_POLICY_LLM_BASE_URL")
+                or "https://api.openai.com/v1"
+            ).rstrip("/"),
+            api_key_env=str(policy_generation_values.get("api_key_env", "OPENAI_API_KEY")).strip(),
+            model=str(
+                policy_generation_values.get("model")
+                or os.getenv("AGENTGATE_POLICY_LLM_MODEL")
+                or "gpt-4o-mini"
+            ),
+            timeout_seconds=float(policy_generation_values.get("timeout_seconds", 30)),
+            temperature=float(policy_generation_values.get("temperature", 0.1)),
+            max_tokens=int(policy_generation_values.get("max_tokens", 2600)),
+            json_response_format=bool(policy_generation_values.get("json_response_format", True)),
+            fallback_to_deterministic=bool(policy_generation_values.get("fallback_to_deterministic", True)),
         ),
         firewall=FirewallProxyConfig(
             protected_routes=protected_routes,

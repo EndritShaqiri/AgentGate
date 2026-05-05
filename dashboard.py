@@ -13,10 +13,10 @@ import streamlit as st
 
 from firewall_proxy.config import load_config
 from firewall_proxy.policy import (
-    compile_policy_document,
     compute_policy_source_hash,
     ensure_policy_tables,
     format_policy_json,
+    generate_policy_document,
     load_active_policy_document,
     load_latest_policy_document,
     load_recent_pbac_decisions,
@@ -316,6 +316,59 @@ def inject_styles() -> None:
             margin-bottom: 0.9rem;
         }
 
+        .section-kicker {
+            margin: 1.4rem 0 0.45rem 0;
+            color: var(--accent-bright);
+            font-size: 0.74rem;
+            font-weight: 780;
+            letter-spacing: 0.13em;
+            text-transform: uppercase;
+        }
+
+        .section-heading {
+            font-size: 1.42rem;
+            line-height: 1.15;
+            font-weight: 780;
+            margin: 0 0 0.35rem 0;
+        }
+
+        .section-copy {
+            color: var(--text-soft);
+            font-size: 0.94rem;
+            line-height: 1.55;
+            margin-bottom: 0.85rem;
+            max-width: 880px;
+        }
+
+        .flow-strip {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0.75rem;
+            margin: 0.8rem 0 1rem 0;
+        }
+
+        .flow-step {
+            padding: 0.82rem 0.95rem;
+            border-radius: 16px;
+            background: rgba(18, 28, 46, 0.68);
+            border: 1px solid rgba(124, 150, 186, 0.16);
+        }
+
+        .flow-step-key {
+            color: var(--accent-bright);
+            font-size: 0.72rem;
+            font-weight: 780;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            margin-bottom: 0.26rem;
+        }
+
+        .flow-step-value {
+            font-size: 0.93rem;
+            color: var(--text-main);
+            line-height: 1.4;
+        }
+
         .badge-row {
             display: flex;
             gap: 0.55rem;
@@ -467,6 +520,62 @@ def safe_json_loads(raw_value: Any) -> dict[str, Any]:
         return json.loads(raw_value)
     except json.JSONDecodeError:
         return {"raw": raw_value}
+
+
+def compact_tool_json(raw_value: Any) -> str:
+    if not raw_value:
+        return ""
+    try:
+        loaded = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
+    except json.JSONDecodeError:
+        return str(raw_value)
+
+    if isinstance(loaded, list):
+        names: list[str] = []
+        for item in loaded:
+            if isinstance(item, dict):
+                name = item.get("name")
+                usage = item.get("usage")
+                if name and usage:
+                    names.append(f"{name} ({usage})")
+                elif name:
+                    names.append(str(name))
+            elif item not in (None, ""):
+                names.append(str(item))
+        return ", ".join(names)
+
+    if isinstance(loaded, dict):
+        return ", ".join(f"{key}: {value}" for key, value in loaded.items())
+
+    return str(loaded)
+
+
+def generate_and_store_pbac_policy_draft(setup: Any) -> Any:
+    config = load_config()
+    outcome = generate_policy_document(setup, config.policy_generation)
+    st.session_state["pbac_policy_draft"] = format_policy_json(outcome.policy)
+    st.session_state["pbac_policy_draft_hash"] = outcome.policy["source_hash"]
+    st.session_state["pbac_policy_editing"] = False
+    st.session_state["pbac_policy_collapsed"] = False
+    st.session_state["pbac_policy_generation_status"] = {
+        "mode": outcome.mode,
+        "used_llm": outcome.used_llm,
+        "fallback_used": outcome.fallback_used,
+        "error": outcome.error,
+    }
+    st.session_state.pop("pbac_policy_editor_text", None)
+    return outcome
+
+
+def render_section_header(kicker: str, title: str, copy: str) -> None:
+    st.markdown(
+        f"""
+        <div class="section-kicker">{html.escape(kicker)}</div>
+        <div class="section-heading">{html.escape(title)}</div>
+        <div class="section-copy">{html.escape(copy)}</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def compute_top_trigger_layer(frame: pd.DataFrame) -> str:
@@ -753,19 +862,28 @@ def render_runtime_agent_setup_editor() -> None:
             st.error(str(exc))
         else:
             mode = "local mock" if saved.use_local_mock else "remote upstream"
-            draft_policy = compile_policy_document(saved)
-            st.session_state["pbac_policy_draft"] = format_policy_json(draft_policy)
-            st.session_state["pbac_policy_draft_hash"] = draft_policy["source_hash"]
-            st.session_state["pbac_policy_editing"] = False
-            st.session_state["pbac_policy_collapsed"] = False
-            st.session_state.pop("pbac_policy_editor_text", None)
+            try:
+                outcome = generate_and_store_pbac_policy_draft(saved)
+            except Exception as exc:
+                st.error(f"Saved setup, but PBAC policy generation failed: {exc}")
+                return
             st.success(
                 f"Saved `{saved.agent_id}` with {mode}. Review and accept the generated PBAC policy below before protected requests continue."
             )
+            if outcome.used_llm:
+                st.caption("PBAC draft generated by the configured LLM policy compiler and validated locally.")
+            elif outcome.fallback_used:
+                st.warning(f"LLM policy generation failed; deterministic fallback draft was generated. {outcome.error}")
 
     if clear_clicked:
         clear_runtime_agent_setup(DB_PATH)
-        for key in ("pbac_policy_draft", "pbac_policy_draft_hash", "pbac_policy_editing", "pbac_policy_collapsed"):
+        for key in (
+            "pbac_policy_draft",
+            "pbac_policy_draft_hash",
+            "pbac_policy_editing",
+            "pbac_policy_collapsed",
+            "pbac_policy_generation_status",
+        ):
             st.session_state.pop(key, None)
         st.warning("Cleared the runtime setup. Protected requests will pause until you save a new one.")
         st.rerun()
@@ -811,13 +929,12 @@ def render_pbac_policy_review() -> None:
         )
 
     with action_col:
-        if st.button("Generate Policy Draft", type="primary", use_container_width=True):
-            draft_policy = compile_policy_document(setup)
-            st.session_state["pbac_policy_draft"] = format_policy_json(draft_policy)
-            st.session_state["pbac_policy_draft_hash"] = draft_policy["source_hash"]
-            st.session_state["pbac_policy_editing"] = False
-            st.session_state["pbac_policy_collapsed"] = False
-            st.session_state.pop("pbac_policy_editor_text", None)
+        if st.button("Generate LLM Policy Draft", type="primary", use_container_width=True):
+            try:
+                generate_and_store_pbac_policy_draft(setup)
+            except Exception as exc:
+                st.error(f"Policy generation failed: {exc}")
+                return
             st.rerun()
         if active_policy is not None and st.button("Load Active Policy", use_container_width=True):
             st.session_state["pbac_policy_draft"] = format_policy_json(active_policy[1])
@@ -834,8 +951,13 @@ def render_pbac_policy_review() -> None:
             draft_text = format_policy_json(active_policy[1])
             st.session_state["pbac_policy_collapsed"] = True
         else:
-            draft_policy = compile_policy_document(setup)
-            draft_text = format_policy_json(draft_policy)
+            try:
+                outcome = generate_and_store_pbac_policy_draft(setup)
+            except Exception as exc:
+                st.error(f"Policy generation failed: {exc}")
+                st.markdown("</div>", unsafe_allow_html=True)
+                return
+            draft_text = format_policy_json(outcome.policy)
             st.session_state["pbac_policy_collapsed"] = False
         st.session_state["pbac_policy_draft"] = draft_text
         st.session_state["pbac_policy_draft_hash"] = source_hash
@@ -846,6 +968,15 @@ def render_pbac_policy_review() -> None:
     st.caption(
         "Review the generated policy. `ACCEPT` persists it as the active PBAC policy; `EDIT` lets you adjust the JSON before saving."
     )
+    generation_status = st.session_state.get("pbac_policy_generation_status")
+    if isinstance(generation_status, dict):
+        if generation_status.get("used_llm"):
+            st.caption("Draft source: LLM policy compiler, locally normalized and validated.")
+        elif generation_status.get("fallback_used"):
+            st.warning(
+                "Draft source: deterministic fallback after LLM generation failed. "
+                f"{generation_status.get('error') or ''}"
+            )
 
     policy_expanded = editing or not bool(st.session_state.get("pbac_policy_collapsed", False))
     with st.expander("Policy JSON", expanded=policy_expanded):
@@ -886,11 +1017,6 @@ def render_pbac_policy_review() -> None:
             with button_col_3:
                 st.caption("PBAC policies are stored separately from firewall scores and never feed risk fusion.")
 
-    recent_pbac = load_recent_pbac_decisions(DB_PATH, max_rows=8)
-    if recent_pbac:
-        with st.expander("Recent PBAC Decisions", expanded=False):
-            st.dataframe(pd.DataFrame(recent_pbac), use_container_width=True, hide_index=True)
-
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -924,6 +1050,122 @@ def _accept_policy_text(raw_text: str, setup: Any) -> None:
     st.session_state.pop("pbac_policy_editor_text", None)
     st.success(f"Accepted PBAC policy #{policy_id}. Protected requests can continue through the PBAC plane.")
     st.rerun()
+
+
+def render_enforcement_flow() -> None:
+    st.markdown(
+        """
+        <div class="flow-strip">
+            <div class="flow-step">
+                <div class="flow-step-key">Plane 1</div>
+                <div class="flow-step-value">PBAC structural policy: active policy, inferred tool intent, exact tool names.</div>
+            </div>
+            <div class="flow-step">
+                <div class="flow-step-key">Plane 2</div>
+                <div class="flow-step-value">L0-L4 content firewall: scope, prompt injection, PII, attachments, multimodal/tool misuse.</div>
+            </div>
+            <div class="flow-step">
+                <div class="flow-step-key">Gateway</div>
+                <div class="flow-step-value">Tool execution goes through /agentgate/tools/execute for a second PBAC check.</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_pbac_operations() -> None:
+    render_section_header(
+        "Structural Plane",
+        "PBAC Detection And Prevention",
+        "Binary policy decisions for requested or inferred tool use. These records are separate from L0-L4 scores.",
+    )
+
+    pbac_rows = load_recent_pbac_decisions(DB_PATH, max_rows=40)
+    if not pbac_rows:
+        st.markdown('<div class="panel-card">', unsafe_allow_html=True)
+        st.info("No PBAC decisions recorded yet. Save and accept a policy, then send protected traffic.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    pbac_frame = pd.DataFrame(pbac_rows)
+    pbac_frame["created_at_raw"] = pd.to_datetime(pbac_frame["created_at"], utc=True, errors="coerce")
+    pbac_frame["created_at"] = pbac_frame["created_at_raw"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    for column in ("requested_tools", "denied_tools", "required_tools"):
+        if column in pbac_frame.columns:
+            pbac_frame[column] = pbac_frame[column].apply(compact_tool_json)
+        else:
+            pbac_frame[column] = ""
+
+    pbac_total = int(len(pbac_frame))
+    pbac_allowed = int((pbac_frame["decision"] == "ALLOW").sum())
+    pbac_denied = int((pbac_frame["decision"] == "DENY").sum())
+    pbac_deny_rate = (pbac_denied / pbac_total) * 100 if pbac_total else 0.0
+    top_pbac_trigger = (
+        str(pbac_frame.loc[pbac_frame["trigger"] != "PBAC_ALLOW", "trigger"].mode().iloc[0])
+        if not pbac_frame.loc[pbac_frame["trigger"] != "PBAC_ALLOW", "trigger"].empty
+        else "PBAC_ALLOW"
+    )
+
+    metric_col_1, metric_col_2, metric_col_3, metric_col_4 = st.columns(4)
+    with metric_col_1:
+        metric_card("PBAC Events", f"{pbac_total:,}", "Recent structural decisions", "#f6f8ff")
+    with metric_col_2:
+        metric_card("PBAC Allowed", f"{pbac_allowed:,}", "Passed to content firewall", DECISION_COLORS["ALLOW"])
+    with metric_col_3:
+        metric_card("PBAC Denied", f"{pbac_denied:,}", f"{pbac_deny_rate:.1f}% structural blocks", DECISION_COLORS["DENY"])
+    with metric_col_4:
+        metric_card("Top PBAC Trigger", top_pbac_trigger, "Most common policy outcome", "#8ab3ff")
+
+    pbac_chart_col, pbac_table_col = st.columns([0.42, 0.58])
+    with pbac_chart_col:
+        st.markdown('<div class="panel-card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">PBAC Outcomes</div>', unsafe_allow_html=True)
+        pbac_counts = (
+            pbac_frame["decision"]
+            .value_counts()
+            .reindex(["ALLOW", "DENY"], fill_value=0)
+            .rename_axis("decision")
+            .reset_index(name="count")
+            .set_index("decision")
+        )
+        st.bar_chart(pbac_counts, color="#8ab3ff", use_container_width=True)
+        st.markdown(
+            '<div class="badge-row">'
+            + decision_badge("ALLOW")
+            + decision_badge("DENY")
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with pbac_table_col:
+        st.markdown('<div class="panel-card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Recent Structural Decisions</div>', unsafe_allow_html=True)
+        pbac_columns = [
+            "id",
+            "created_at",
+            "agent_id",
+            "policy_id",
+            "decision",
+            "trigger",
+            "reason",
+            "requested_tools",
+            "denied_tools",
+            "required_tools",
+        ]
+        st.dataframe(
+            pbac_frame[pbac_columns],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "reason": st.column_config.TextColumn(width="large"),
+                "requested_tools": st.column_config.TextColumn(width="medium"),
+                "denied_tools": st.column_config.TextColumn(width="medium"),
+                "required_tools": st.column_config.TextColumn(width="medium"),
+            },
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 st.set_page_config(page_title="AI Firewall Dashboard", layout="wide")
@@ -984,7 +1226,7 @@ st.markdown(
         <h1 class="hero-title">AI Firewall Dashboard</h1>
         <div class="hero-subtitle">
             Monitor identity-protection decisions, review request risk, and control live enforcement
-            from a security-first dashboard inspired by SlashID’s product style.
+            from a security-first dashboard.
         </div>
         <div>
             <span class="source-pill">SQLite source: {DB_PATH}</span>
@@ -1000,6 +1242,14 @@ st.markdown(
 
 render_runtime_agent_setup_editor()
 render_pbac_policy_review()
+render_enforcement_flow()
+render_pbac_operations()
+
+render_section_header(
+    "Content Plane",
+    "L0-L4 Detection And Prevention",
+    "Layered content decisions for protected requests after PBAC has allowed the structural policy check.",
+)
 
 logs = load_logs()
 if logs.empty:
@@ -1012,16 +1262,19 @@ logs["created_at"] = logs["created_at_raw"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 agent_options = ["All", *sorted(logs["agent_id"].dropna().astype(str).unique().tolist())]
 decision_options = ["All", "ALLOW", "BYPASS", "WARN", "DENY"]
 
+st.markdown('<div class="panel-card">', unsafe_allow_html=True)
+st.markdown('<div class="section-title">L0-L4 Filters</div>', unsafe_allow_html=True)
 control_col_1, control_col_2, control_col_3 = st.columns([1.25, 1, 1])
 with control_col_1:
     search_query = st.text_input(
-        "Search logs",
+        "Search content logs",
         placeholder="Search by prompt, decision, layer, or agent",
     )
 with control_col_2:
-    agent_filter = st.selectbox("Agent", agent_options, index=0)
+    agent_filter = st.selectbox("Content Agent", agent_options, index=0)
 with control_col_3:
-    decision_filter = st.selectbox("Decision", decision_options, index=0)
+    decision_filter = st.selectbox("Content Decision", decision_options, index=0)
+st.markdown("</div>", unsafe_allow_html=True)
 
 filtered_logs = filter_logs(logs, search_query, agent_filter, decision_filter)
 
@@ -1041,23 +1294,23 @@ avg_risk = float(filtered_logs["final_risk"].fillna(0).mean())
 
 metric_col_1, metric_col_2, metric_col_3, metric_col_4 = st.columns(4)
 with metric_col_1:
-    metric_card("Requests In View", f"{total_requests:,}", "Filtered event volume", "#f6f8ff")
+    metric_card("L0-L4 Events", f"{total_requests:,}", "Filtered content decisions", "#f6f8ff")
 with metric_col_2:
-    metric_card("Allowed", f"{allow_count:,}", "Requests that passed upstream", DECISION_COLORS["ALLOW"])
+    metric_card("Content Allowed", f"{allow_count:,}", "Forwarded upstream", DECISION_COLORS["ALLOW"])
 with metric_col_3:
     metric_card(
-        "Protection Mix",
+        "Content Blocks",
         f"{block_rate:.1f}%",
         f"WARN or DENY; {bypass_count:,} bypassed",
         DECISION_COLORS["WARN"],
     )
 with metric_col_4:
-    metric_card("Top Trigger Layer", top_layer, "Most frequent non-pass layer", "#8ab3ff")
+    metric_card("Top L0-L4 Trigger", top_layer, "Most frequent non-pass layer", "#8ab3ff")
 
 analytics_col_1, analytics_col_2 = st.columns([1.2, 0.8])
 with analytics_col_1:
     st.markdown('<div class="panel-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Decision Flow</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">L0-L4 Outcome Flow</div>', unsafe_allow_html=True)
     decision_counts = (
         filtered_logs["decision"]
         .value_counts()
@@ -1080,14 +1333,14 @@ with analytics_col_1:
 
 with analytics_col_2:
     st.markdown('<div class="panel-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Signal Snapshot</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Layer Signal Snapshot</div>', unsafe_allow_html=True)
     score_card("Average Scope Score", avg_scope, "#8ab3ff")
     score_card("Average PG2 Score", avg_injection, DECISION_COLORS["WARN"])
     score_card("Average Final Risk", avg_risk, DECISION_COLORS["DENY"])
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown('<div class="panel-card">', unsafe_allow_html=True)
-st.markdown('<div class="section-title">Event Log</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-title">L0-L4 Event Log</div>', unsafe_allow_html=True)
 
 table_columns = [
     "id",
@@ -1126,7 +1379,7 @@ elif not filtered_logs.empty:
     selected_row_index = 0
 
 st.markdown('<div class="panel-card">', unsafe_allow_html=True)
-st.markdown('<div class="section-title">Deep Dive</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-title">L0-L4 Deep Dive</div>', unsafe_allow_html=True)
 
 if selected_row_index is None:
     st.info("Select a row from the table to inspect the raw scope and classifier scores.")
