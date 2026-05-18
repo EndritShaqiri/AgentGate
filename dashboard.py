@@ -1168,7 +1168,7 @@ def render_pbac_operations() -> None:
         st.markdown("</div>", unsafe_allow_html=True)
 
 
-st.set_page_config(page_title="AI Firewall Dashboard", layout="wide")
+st.set_page_config(page_title="SlashID Research Lab", layout="wide")
 
 
 @st.cache_resource
@@ -1188,8 +1188,9 @@ with st.sidebar:
         f"""
         <div class="sidebar-panel">
             <img class="sidebar-logo" src="{slashid_logo_src}" alt="SlashID" />
-            <div class="sidebar-title">SlashID AI Firewall</div>
+            <div class="sidebar-title">SlashID Research Lab</div>
             <div class="sidebar-copy">
+                AgentGate research prototype.
                 Toggle global protection live. When off, requests still go through the proxy but bypass
                 firewall enforcement and forward upstream untouched.
             </div>
@@ -1200,7 +1201,7 @@ with st.sidebar:
     firewall_enabled = st.toggle(
         "Protect Requests Through Proxy",
         value=initial_firewall_enabled,
-        help="Turn SlashID AI Firewall enforcement on or off globally.",
+        help="Turn AgentGate enforcement on or off globally.",
     )
     if firewall_enabled != initial_firewall_enabled:
         set_global_firewall_enabled(firewall_enabled)
@@ -1214,19 +1215,16 @@ st.markdown(
     f"""
     <div class="hero-card">
         <div class="brand-row">
-            <div class="brand-mark">
-                <img src="{slashid_logo_src}" alt="SlashID" />
-            </div>
             <div class="brand-copy">
-                <div class="brand-name">SlashID AI Firewall</div>
-                <div class="brand-tag">Identity Protection Operations</div>
+                <div class="brand-name">SlashID Research Lab</div>
+                <div class="brand-tag">AgentGate research prototype</div>
             </div>
         </div>
-        <div class="hero-kicker">Operational Intelligence</div>
-        <h1 class="hero-title">AI Firewall Dashboard</h1>
+        <div class="hero-kicker">Research Preview</div>
+        <h1 class="hero-title">AgentGate research prototype</h1>
         <div class="hero-subtitle">
-            Monitor identity-protection decisions, review request risk, and control live enforcement
-            from a security-first dashboard.
+            Monitor access-control decisions, review L0-L4 request risk, and control live enforcement
+            from a research dashboard.
         </div>
         <div>
             <span class="source-pill">SQLite source: {DB_PATH}</span>

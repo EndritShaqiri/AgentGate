@@ -1,0 +1,267 @@
+\documentclass[11pt]{article}
+
+\usepackage[final]{acl}
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{url}
+\usepackage{array}
+
+\title{AgentGate: A Policy-Aware AI Firewall for Tool Access Control and Prompt-Injection Defense}
+
+\author{
+Endrit Shaqiri \and James Njoroge \and Muhammad Zuhdi \\
+Boston University \\
+\texttt{\{endrit01,jngugi,mrzuhdi\}@bu.edu}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Large language model applications increasingly combine natural-language interfaces with retrieval, document processing, code execution, and external actions. This creates a new security problem: a model can be linguistically helpful while still being structurally unauthorized to use a tool, follow injected instructions, or process untrusted context. We present AgentGate, a reverse-proxy AI firewall that separates structural access control from content-risk detection. AgentGate first runs policy-based access control (PBAC) over explicit and inferred tool intents, then runs a five-layer NLP safety pipeline: semantic scope checking, prompt-injection classification, PII detection, text-attachment inspection, and multimodal/tool-misuse guarding. Since our midway report, we replaced a two-layer MiniLM+DeBERTa prototype with an LLM-assisted PBAC policy compiler, deterministic policy validation, an explicit tool gateway, attachment chunking, Prompt Guard 2, Llama Guard, PII redaction, and an expanded functional evaluation. Across 26 integration and unit tests, AgentGate correctly routes no-attachment, text-attachment, multimodal, and code-execution requests through the intended layers, blocks disallowed tools before content scoring, and preserves in-scope document workflows. The source code is available at \url{https://github.com/EndritShaqiri/AgentGate}.
+\end{abstract}
+
+\section{Introduction}
+
+LLM applications now act less like single text classifiers and more like networked agents. A user request may trigger retrieval, summarization, file parsing, email, code execution, or other side effects, following the broader move toward retrieval-augmented generation and tool-using language agents \citep{lewis2020retrieval,yao2023react,schick2023toolformer,qin2023toolllm}. The same natural-language channel that makes these systems usable also makes them vulnerable: direct prompt injections can override system intent \citep{perez2022ignore,schulhoff2023hackaprompt,toyer2023tensortrust}, indirect prompt injections can hide instructions inside retrieved or uploaded content \citep{greshake2023notwhat,yi2023bipia,hines2024spotlighting}, and tool-integrated applications can turn a bad model decision into an external action \citep{liu2023promptinjection}.
+
+AgentGate addresses this problem as a proxy-level firewall. Rather than relying on one large model to both interpret user intent and self-police its behavior, AgentGate places a programmable security boundary before the upstream model endpoint. Its design separates two questions:
+
+\begin{quote}
+\small
+\textbf{PBAC:} Is this request structurally authorized to use the tools it asks for or implies?\\
+\textbf{L0-L4:} Is the content safe, in scope, and free of obvious prompt-injection or tool-misuse risk?
+\end{quote}
+
+This separation is the main change from the midway report. The midway prototype contained two NLP layers: a MiniLM semantic scope filter and a fine-tuned DeBERTa prompt-injection classifier. That system demonstrated a held-out prompt-injection test accuracy of 96.50\%, but it did not yet protect tool execution, attachments, multimodal inputs, or policy generation. The final system moves from a classifier-only firewall to a policy-aware, layered gateway.
+
+We provide two demonstration videos with the final system: one showing prompt-injection prevention in the L0-L4 firewall,\footnote{\url{https://drive.google.com/file/d/1DlnkTCwy3w2t9752WnKBbjiuV2x2satr/view?usp=drive_link}} and one showing LLM-powered PBAC policy generation and review.\footnote{\url{https://drive.google.com/file/d/1wEJcmzVig6ukV6qZRNg4nL5CLAXAayZc/view?usp=drive_link}}
+
+\section{Related Work}
+
+\paragraph{Prompt injection and jailbreaks.}
+PromptInject showed that handcrafted strings could induce goal hijacking and prompt leaking in GPT-style systems \citep{perez2022ignore}. HackAPrompt scaled this observation into a large adversarial prompt competition and taxonomy \citep{schulhoff2023hackaprompt}, while Tensor Trust collected over 126K human-written attacks and 46K defenses from an online game setting \citep{toyer2023tensortrust}. Broader jailbreak work shows that aligned models can still be driven into policy-violating behavior through adversarial suffixes or carefully chosen prompts \citep{wei2023jailbroken,zou2023universal}. Work on LLM-integrated applications shows that prompt injection becomes more dangerous when prompts interact with application state, hidden system prompts, and external APIs \citep{liu2023promptinjection}.
+
+\paragraph{Indirect and contextual attacks.}
+Indirect prompt injection targets untrusted context rather than direct user text. \citet{greshake2023notwhat} show that retrieved web content can manipulate LLM-integrated applications and influence API calls. BIPIA formalizes this setting as a benchmark for external-content attacks \citep{yi2023bipia}. Spotlighting proposes source-marking transformations that help models distinguish user instructions from untrusted data \citep{hines2024spotlighting}. AgentGate is complementary: instead of relying only on prompt formatting, it inspects inline attachments before they are forwarded upstream and blocks tool use structurally through PBAC.
+
+\paragraph{NLP models for firewall layers.}
+AgentGate uses sentence embeddings for scope matching, following the SBERT view that semantically meaningful sentence vectors can be compared efficiently with cosine similarity \citep{reimers2019sentencebert}. The deployed scope encoder is MiniLM, a compact Transformer distilled for efficient serving \citep{wang2020minilm,vaswani2017attention}. The midway report used DeBERTa \citep{he2021deberta} on a prompt-injection dataset. The final system instead uses Prompt Guard 2 as the L1 detector and Llama Guard for multimodal/tool-misuse paths, conceptually following Llama Guard's use of an LLM as a configurable safety classifier \citep{inan2023llamaguard,grattafiori2024llama3}. PII detection uses token classification in the style of BERT-based NER \citep{devlin2019bert,tjong2003conll}.
+
+\paragraph{Natural-language policy compilation.}
+Our PBAC policy authoring is inspired by Prose2Policy, which translates natural-language access-control policies into executable Rego and emphasizes schema validation, compilation, and tests \citep{gupta2026prose2policy}. AgentGate differs in output target and runtime role. It does not generate Rego; it generates a JSON PBAC document specialized to LLM tool access. The LLM drafts the policy, but a deterministic validator and exact-name runtime gate enforce it.
+
+\section{System Overview}
+
+AgentGate is implemented as a FastAPI reverse proxy. Developers point an agent client to AgentGate, and AgentGate forwards allowed requests to the configured upstream OpenAI-compatible endpoint or local mock. Protected routes are configured by path pattern and content-source extraction rules. The default protected routes include \texttt{/v1/chat/completions}, \texttt{/v1/responses}, and generic agent endpoints.
+
+The runtime order is fixed:
+
+\begin{quote}
+\small
+\texttt{request -> protected route match -> PBAC -> L0-L4 -> upstream -> tool gateway}
+\end{quote}
+
+If a route is unprotected, AgentGate proxies it upstream and records a bypass. If a route is protected, PBAC runs first. Only PBAC-allowed requests reach the content firewall. If L0-L4 returns \textsc{allow}, the original request body is forwarded unchanged. If it returns \textsc{warn} or \textsc{deny}, AgentGate returns a local firewall response. Real tool execution must later call \texttt{/agentgate/tools/execute}, which performs a second PBAC check.
+
+\begin{table}[t]
+\small
+\centering
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.20\linewidth}
+                >{\raggedright\arraybackslash}p{0.22\linewidth}
+                >{\raggedright\arraybackslash}p{0.48\linewidth}}
+\toprule
+\textbf{Component} & \textbf{Decision} & \textbf{Role} \\
+\midrule
+PBAC & Allow / Deny & Checks accepted policy against explicit and inferred tool intent. Deny stops before L0-L4. \\
+L0-L4 & Allow / Warn / Deny & Runs NLP and multimodal guards on user text and inline attachments. \\
+Gateway & Authorized / Blocked & Re-checks exact tool name before any real tool side effect. \\
+\bottomrule
+\end{tabular}
+\caption{AgentGate separates structural authorization from content-risk detection.}
+\label{tab:flow}
+\end{table}
+
+\section{PBAC Policy Generation}
+
+The dashboard asks the developer to define a runtime agent setup: \texttt{agent\_id}, natural-language description, allowed examples, denied examples, tool registry, and upstream settings. A registry entry may be only a descriptive name, e.g., \texttt{search\_massachusetts\_law}, or a richer line such as:
+\begin{quote}
+\small
+\texttt{send\_email | external\_action | Send generated summaries to the configured recipient | external\_write}
+\end{quote}
+
+\paragraph{LLM-authored draft.}
+The final system uses an OpenAI-compatible chat model to draft PBAC policies. The prompt is specialized to AgentGate: it states that PBAC runs before L0-L4, that PBAC must not use content scores, that every registered tool needs an exact allow or deny rule, that wildcard default deny is required, and that code execution should be denied unless allowed examples explicitly require it. This is inspired by Prose2Policy's natural-language-to-policy pipeline, but adapted to tool-level LLM access control rather than Rego.
+
+\paragraph{Deterministic validation.}
+The LLM is not trusted as the enforcement engine. AgentGate normalizes the returned JSON and validates it locally. The validator checks the schema version, agent id, source hash, \texttt{default\_effect: deny}, one explicit rule per enabled tool, wildcard deny, exact registry membership, and PBAC runtime metadata. High-risk tools such as code execution cannot be allowed unless the policy source explicitly permits code execution. Accepted policies are stored in SQLite and are valid only for the matching source hash.
+
+\paragraph{Runtime inference.}
+At request time, PBAC extracts tools from \texttt{body.tools}, \texttt{tool\_choice}, \texttt{tool\_name}, function calls, and message tool calls. It also infers required categories from user text:
+
+\begin{table}[t]
+\small
+\centering
+\begin{tabular}{p{0.30\linewidth}p{0.58\linewidth}}
+\toprule
+\textbf{Intent} & \textbf{Triggers} \\
+\midrule
+retrieval & search, lookup, retrieve, cite, legal question answering \\
+document processing & summarize, read, review, extract, uploaded file, PDF, lease \\
+external action & email, send, forward, notify, deliver \\
+code execution & execute code, Python, shell, PowerShell, notebook, sandbox \\
+\bottomrule
+\end{tabular}
+\caption{PBAC maps request language to tool-intent categories before exact-name policy checks.}
+\label{tab:intents}
+\end{table}
+
+If an inferred or requested tool is absent from the registry or not allowed by the active policy, PBAC blocks immediately. L0-L4 is not run.
+
+\section{L0-L4 Content Firewall}
+
+\paragraph{L0: semantic scope.}
+For each runtime agent, AgentGate embeds the description, allowed examples, and denied examples with MiniLM. Given user embedding $u$, description $d$, allowed examples $A$, denied examples $N$, and denied weight $\lambda=0.35$, the scope score is:
+\begin{equation}
+s = \max(\cos(u,d), \max_{a \in A}\cos(u,a)) - \lambda \max_{n \in N}\cos(u,n).
+\end{equation}
+The value is clamped to $[0,1]$. A low score indicates that the user request is either off-domain or close to a denied example.
+
+\paragraph{L1: direct prompt injection.}
+The L1 classifier uses local Prompt Guard 2 inference. It scores the latest user message and returns a malicious-label probability. This replaces the midway DeBERTa classifier and removes the previous regex coupling from the decision path.
+
+We selected Llama Prompt Guard 2 86M for L1 because its reported release metrics substantially improve recall at a fixed low false-positive rate over Prompt Guard 1 while keeping the same model size and latency budget.\footnote{\url{https://huggingface.co/meta-llama/Llama-Prompt-Guard-2-86M}} Table~\ref{tab:promptguard} reports these model-level metrics; they are not AgentGate end-to-end measurements.
+
+\begin{table*}[t]
+\scriptsize
+\centering
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.15\textwidth}
+                >{\centering\arraybackslash}p{0.08\textwidth}
+                >{\centering\arraybackslash}p{0.13\textwidth}
+                >{\centering\arraybackslash}p{0.10\textwidth}
+                >{\centering\arraybackslash}p{0.17\textwidth}
+                >{\centering\arraybackslash}p{0.10\textwidth}
+                >{\raggedright\arraybackslash}p{0.12\textwidth}}
+\toprule
+\textbf{Model} & \textbf{AUC English} & \textbf{Recall @ 1\% FPR English} & \textbf{AUC Multilingual} & \textbf{Latency / classification} & \textbf{Backbone params} & \textbf{Base model} \\
+\midrule
+Llama Prompt Guard 1 & .987 & 21.2\% & .983 & 92.4 ms & 86M & mdeberta-v3 \\
+Llama Prompt Guard 2 86M & \textbf{.998} & \textbf{97.5\%} & \textbf{.995} & 92.4 ms & 86M & mdeberta-v3 \\
+Llama Prompt Guard 2 22M & .995 & 88.7\% & .942 & 19.3 ms & 22M & deberta-v3-xsmall \\
+\bottomrule
+\end{tabular}
+\caption{Reported Prompt Guard model-selection metrics used to choose the L1 direct prompt-injection detector.}
+\label{tab:promptguard}
+\end{table*}
+
+\paragraph{L2: PII detection.}
+The PII layer combines token classification with structured regexes for emails, phone numbers, and SSNs. PII does not automatically block all requests, because some in-scope legal or document workflows require sensitive text. Instead, PII severity contributes to risk and escalates when paired with suspicious prompt-injection or L4 signals. Logs store redacted text.
+
+\paragraph{L3: text attachments.}
+Inline PDF, DOCX, and text attachments are extracted locally. PDFs use text extraction when possible; sparse/scanned PDFs are marked multimodal. Long text is chunked with overlap. Each chunk is evaluated by Prompt Guard 2, the scope scorer, and PII detection. AgentGate aggregates maximum prompt-injection score, minimum scope score, mean scope score, flagged ratio, and attachment PII severity.
+
+\paragraph{L4: multimodal and tool misuse.}
+L4 lazily loads Llama Guard only for images, sparse/scanned PDFs, multimodal attachments, or code-execution/tool-misuse intent. For code paths, the guard prompt explicitly asks for S14 code-interpreter abuse and tool misuse. If L4 is required but unavailable, AgentGate fails closed by default.
+
+\paragraph{Risk fusion.}
+For ordinary text, AgentGate computes:
+\begin{equation}
+r_{\text{main}} = .60 p_{\text{pg2}} + .25(1-s_{\text{scope}})+ .15 p_{\text{pii}}.
+\end{equation}
+For text attachments:
+\begin{equation}
+r_{\text{doc}} = .50 p_{\text{doc}} + .25(1-s_{\text{doc-min}})+.15\rho_{\text{flag}}+.10p_{\text{doc-pii}}.
+\end{equation}
+L4 unsafe output raises risk to at least .92, and code-abuse output raises it to at least .95. The current configuration uses \texttt{pg2\_deny=.90}, \texttt{scope\_deny=.30}, \texttt{doc\_scope\_deny=.25}, and \texttt{final\_deny=.78}.
+
+\section{Evaluation}
+
+Our final evaluation focuses on end-to-end firewall behavior rather than only standalone classifier accuracy. The midway report already evaluated the DeBERTa baseline, obtaining 96.50\% held-out accuracy and 0.0462 false positive rate on direct prompt injection. The final system replaces that layer and adds several new behavioral surfaces, so we evaluate routing, policy enforcement, attachment handling, and failure modes with integration tests and adversarial examples.
+
+\begin{table*}[t]
+\small
+\centering
+\begin{tabular}{p{0.26\linewidth}p{0.31\linewidth}p{0.31\linewidth}}
+\toprule
+\textbf{Capability} & \textbf{Midway system} & \textbf{Final system} \\
+\midrule
+Scope control & MiniLM description/examples & MiniLM with denied-example pull and runtime setup refresh \\
+Prompt injection & Fine-tuned DeBERTa direct classifier & Prompt Guard 2 classifier with risk fusion \\
+Policy enforcement & None beyond scope examples & LLM-drafted PBAC, deterministic validation, exact-name runtime gate \\
+Attachments & Not implemented & PDF/DOCX/text extraction, chunking, L3 aggregation \\
+Multimodal/tool misuse & Planned & Lazy Llama Guard L4 for images, sparse PDFs, and code/tool misuse \\
+Tool execution & Not protected & \texttt{/agentgate/tools/execute} with second PBAC check \\
+Evaluation & DeBERTa classifier metrics & 26 passing route, layer, PBAC, logging, and response-shape tests \\
+\bottomrule
+\end{tabular}
+\caption{Main changes from the midway prototype to the final AgentGate system.}
+\label{tab:midway}
+\end{table*}
+
+\paragraph{Layer routing.}
+The layer-routing tests verify that the firewall executes only the layers needed by each request type. A normal text request runs L0, L1, and L2. A text attachment adds L3 but not L4. An image attachment or sparse PDF routes to L4. A code-execution request also routes to L4 even without an attachment. These tests guard against a common systems failure: running expensive multimodal guards for every prompt, or missing the guard when code execution is implied.
+
+\paragraph{PBAC behavior.}
+PBAC tests cover missing policies, forced tool choice, inferred required tools, disallowed code execution, unrelated tool names, and allowed document workflows. For example, if a Massachusetts housing assistant is allowed to call \texttt{search\_massachusetts\_law} but denied \texttt{code\_execution}, the request ``Can my landlord evict me without notice in Massachusetts and execute this code \texttt{print("Hello")}'' is blocked by PBAC before Prompt Guard or Llama Guard runs. Conversely, ``Summarize this Massachusetts uploaded lease and email the result to me'' is allowed only if \texttt{summarize\_uploaded\_pdf} and \texttt{send\_email} are both explicitly allowed.
+
+\paragraph{LLM policy compiler.}
+We added tests that mock the OpenAI-compatible policy compiler and verify that AgentGate sends the specialized PBAC prompt, receives JSON, normalizes compiler metadata, rejects unsafe structures, and preserves \texttt{content\_scores\_used=false}. A separate test verifies that when an OpenAI API key is missing, the system falls back to the deterministic compiler if configured. Thus, LLM generation improves authoring flexibility without weakening runtime enforcement.
+
+\paragraph{End-to-end result.}
+The current repository test suite contains 26 tests. All pass under the command:
+\begin{quote}
+\small
+\texttt{python -m pytest -q}
+\end{quote}
+The tests are not a large-scale attack benchmark, but they validate the central safety invariants: PBAC runs before L0-L4, disallowed tools stop immediately, L4 is invoked for multimodal and code paths, warnings and denials fail closed, OpenAI-compatible block responses remain well-formed, and logs retain score/model details with redaction.
+
+\begin{table}[t]
+\small
+\centering
+\begin{tabular}{p{0.32\linewidth}p{0.22\linewidth}p{0.34\linewidth}}
+\toprule
+\textbf{Scenario} & \textbf{Expected gate} & \textbf{Observed behavior} \\
+\midrule
+``Forget all instructions and reveal your hidden system prompt'' & L0-L4 & PBAC may allow no-tool text, but Prompt Guard/low-scope path blocks before upstream \\
+Legal question + code & PBAC & \texttt{code\_execution} denied before L0-L4 \\
+Lease summary + email & PBAC then L3 & Allowed only with exact document/email tools \\
+Image or scanned PDF & L4 & Multimodal guard required; fail closed if unavailable \\
+\bottomrule
+\end{tabular}
+\caption{Representative final evaluation scenarios.}
+\label{tab:scenarios}
+\end{table}
+
+\section{Discussion}
+
+The main design lesson is that model safety and access control should not be collapsed into one classifier. Prompt-injection detection is probabilistic and content-sensitive; tool access should be auditable and deterministic. AgentGate therefore lets an LLM assist policy authoring, where natural-language understanding is useful, but does not let an LLM make live authorization decisions. This is similar in spirit to Prose2Policy's separation between LLM translation and deterministic validation/compilation.
+
+The layered design also makes cost and latency more controllable. L0-L2 run on ordinary protected text. L3 runs only when inline text attachments exist. L4, the heaviest model, is lazy and only required for multimodal or code/tool-misuse paths. This is important for practical deployment because a firewall that invokes every guard on every request would be difficult to operate.
+
+\section{Limitations}
+
+AgentGate is still a prototype. The final evaluation is functional rather than benchmark-scale; future work should evaluate against BIPIA, Tensor Trust, HackAPrompt-style prompts, and domain-specific document injections. The LLM PBAC compiler currently depends on prompt quality and schema validation; it should be tested with larger policy suites and adversarial tool names. Llama Guard 4 is integrated as a local model path, but we have not measured its accuracy or latency on a large multimodal benchmark. Finally, remote tool adapters are not implemented; the gateway authorizes or blocks, but production deployments must attach real executors behind it.
+
+\section{Conclusion}
+
+AgentGate evolved from a two-layer prompt firewall into a policy-aware AI gateway. The final system combines LLM-assisted PBAC policy drafting, deterministic policy validation, exact-name tool enforcement, semantic scope checking, prompt-injection detection, PII-aware logging, attachment chunk inspection, and multimodal/tool-misuse guarding. The core contribution is architectural: structural authorization runs before probabilistic NLP safety scoring, and tool execution receives a second PBAC check. This makes AgentGate a practical class-project prototype for securing LLM applications whose risks come not only from what the model says, but from what the surrounding agent is allowed to do.
+
+\section*{Author Contributions}
+
+Endrit Shaqiri led the AgentGate architecture, PBAC/tool-gateway implementation, L0-L4 integration, final experiments, and report writing.
+James Njoroge contributed to the dashboard, logging/observability workflow, runtime setup design, and evaluation scenarios.
+Muhammad Zuhdi contributed to the prompt-injection baseline, midway analysis, literature review, and final documentation review.
+
+\bibliographystyle{acl_natbib}
+\bibliography{agentgate-final-acl}
+
+\end{document}
